@@ -57,9 +57,8 @@ class Settings(BaseSettings):
     # Telemetry
     telemetry_enabled: bool = True
 
-    # Scratchpad Memory Configuration
-    scratchpad_max_tokens: int = 2000  # Total token budget for scratchpad
-    scratchpad_entry_ttl_minutes: int = 30  # Entry expiration time
+    # Scratchpad Memory Configuration (persistent SQLite storage)
+    scratchpad_db_path: str = "data/scratchpad/notes.db"  # SQLite database path (relative to backend/)
     scratchpad_inject_budget: int = 1500  # Tokens for LangGraph injection
 
     @property
@@ -75,6 +74,11 @@ class Settings(BaseSettings):
         # Path relative to backend root: backend/data/schematics/schematics.json
         # __file__ = backend/app/config.py, so .parent.parent = backend/
         return Path(__file__).parent.parent.resolve() / "data" / "schematics" / "schematics.json"
+
+    @property
+    def scratchpad_path(self) -> Path:
+        """Get absolute path to scratchpad SQLite database."""
+        return Path(__file__).parent.parent.resolve() / self.scratchpad_db_path
 
     @property
     def has_llm_config(self) -> bool:

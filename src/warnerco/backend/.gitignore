@@ -39,6 +39,9 @@ htmlcov/
 # Chroma data (local only)
 ../data/chroma/
 
+# Scratchpad SQLite database (persistent local storage)
+data/scratchpad/
+
 # OS
 .DS_Store
 Thumbs.db

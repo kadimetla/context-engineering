@@ -1,42 +1,49 @@
-"""Scratchpad Memory Store for WARNERCO Robotics Schematica.
+"""SQLite-backed Scratchpad Memory Store for WARNERCO Robotics Schematica.
 
-This module implements a session-scoped in-memory working memory that
-complements the vector (Chroma) and graph (SQLite + NetworkX) memory layers.
+This module implements a persistent scratchpad memory that complements the
+vector (Chroma) and graph (SQLite + NetworkX) memory layers.
 
 Key Features:
-- In-memory triplet storage with subject-predicate-object entries
+- SQLite-backed persistent storage (entries survive server restarts)
 - LLM-powered minimization on write (reduces token usage)
-- LLM-powered enrichment on read (expands context)
+- LLM-powered enrichment on write (expands context, persisted to DB)
 - Token tracking using tiktoken for accurate counting
-- Automatic TTL-based entry expiration
-- Token budget enforcement with oldest-first eviction
-- Thread-safe operations using RLock
+- Thread-safe operations using thread-local SQLite connections
+- No TTL, no write budget — entries persist until explicitly deleted
 
 Usage:
     store = get_scratchpad_store()
 
-    # Write with minimization
+    # Write with minimization + enrichment (both on ingest)
     entry = await store.write(
         subject="WRN-00006",
         predicate="observed",
         object_="thermal_system",
         content="WRN-00006 has thermal issues when running hydraulics",
-        minimize=True
+        minimize=True,
+        enrich=True,
     )
 
-    # Read with optional enrichment
-    entries = await store.read(subject="WRN-00006", enrich=True)
+    # Read — returns cached enriched_content (no LLM call)
+    entries = await store.read(subject="WRN-00006")
 
     # Get context for LangGraph injection
     context_lines, token_count = store.get_context_for_injection(token_budget=1500)
 """
 
+import json
+import logging
+import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Generator, List, Optional, Tuple
 
 import tiktoken
+
+logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.models.scratchpad import (
@@ -50,47 +57,98 @@ from app.models.scratchpad import (
 
 
 class ScratchpadStore:
-    """In-memory triplet store with LLM minimization and enrichment.
+    """SQLite-backed triplet store with LLM minimization and enrichment on ingest.
 
-    This store provides session-scoped working memory for observations,
-    inferences, and contextual notes. It uses LLM calls to:
-    - Minimize content on write (reduce token usage while preserving meaning)
-    - Enrich content on read (expand context when detailed information is needed)
+    This store provides persistent memory for observations, inferences, and
+    contextual notes. It uses LLM calls on write to:
+    - Minimize content (reduce token usage while preserving meaning)
+    - Enrich content (expand context for richer retrieval)
 
-    The store enforces a token budget and automatically evicts oldest entries
-    when the budget is exceeded.
+    Both minimized and enriched versions are persisted to SQLite. Reads
+    return the cached content without any LLM calls.
+
+    Thread Safety:
+        Uses thread-local SQLite connections (same pattern as graph_store.py).
     """
 
-    def __init__(
-        self,
-        max_tokens: Optional[int] = None,
-        entry_ttl_minutes: Optional[int] = None,
-        inject_budget: Optional[int] = None,
-    ):
+    def __init__(self, db_path: Optional[Path | str] = None):
         """Initialize the scratchpad store.
 
         Args:
-            max_tokens: Maximum total tokens allowed (default from settings)
-            entry_ttl_minutes: Minutes until entry expires (default from settings)
-            inject_budget: Token budget for LangGraph injection (default from settings)
+            db_path: Path to SQLite database. Defaults to settings.scratchpad_path.
         """
-        self._entries: Dict[str, ScratchpadEntry] = {}
-        self._lock = threading.RLock()
+        if db_path is None:
+            self.db_path = settings.scratchpad_path
+        elif isinstance(db_path, str):
+            self.db_path = Path(db_path)
+        else:
+            self.db_path = db_path
 
-        # Configuration
-        self._max_tokens = max_tokens or settings.scratchpad_max_tokens
-        self._entry_ttl_minutes = entry_ttl_minutes or settings.scratchpad_entry_ttl_minutes
-        self._inject_budget = inject_budget or settings.scratchpad_inject_budget
+        self._local = threading.local()
+        self._write_lock = threading.RLock()
 
-        # Token counting - use cl100k_base encoding (GPT-4/GPT-3.5)
+        # Token counting — use cl100k_base encoding (GPT-4/GPT-3.5)
         try:
             self._encoding = tiktoken.get_encoding("cl100k_base")
         except Exception:
-            # Fallback if tiktoken fails to load
             self._encoding = None
 
-        # Cache for enriched content
-        self._enrichment_cache: Dict[str, str] = {}
+        # Initialize database
+        self._init_db()
+
+    # =========================================================================
+    # DATABASE INFRASTRUCTURE
+    # =========================================================================
+
+    @contextmanager
+    def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
+        """Get a thread-local database connection.
+
+        Yields:
+            SQLite connection for the current thread
+        """
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(str(self.db_path))
+            self._local.conn.row_factory = sqlite3.Row
+            # Enable WAL mode for concurrent reads
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+        yield self._local.conn
+
+    def _init_db(self) -> None:
+        """Initialize the SQLite database schema."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS entries (
+                    id               TEXT PRIMARY KEY,
+                    subject          TEXT NOT NULL,
+                    predicate        TEXT NOT NULL,
+                    object_          TEXT NOT NULL,
+                    content          TEXT NOT NULL,
+                    original_content TEXT NOT NULL,
+                    enriched_content TEXT,
+                    original_tokens  INTEGER NOT NULL DEFAULT 0,
+                    minimized_tokens INTEGER NOT NULL DEFAULT 0,
+                    enriched_tokens  INTEGER NOT NULL DEFAULT 0,
+                    created_at       TEXT NOT NULL,
+                    metadata         TEXT
+                )
+            """)
+
+            # Indexes for efficient lookups
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sp_subject ON entries(subject)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sp_predicate ON entries(predicate)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sp_created_at ON entries(created_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sp_subject_predicate ON entries(subject, predicate)")
+
+            conn.commit()
+
+    # =========================================================================
+    # TOKEN COUNTING
+    # =========================================================================
 
     def _count_tokens(self, text: str) -> int:
         """Count tokens in text using tiktoken.
@@ -106,58 +164,14 @@ class ScratchpadStore:
         # Fallback: rough estimate (words * 1.3)
         return int(len(text.split()) * 1.3)
 
-    def _generate_id(self) -> str:
+    @staticmethod
+    def _generate_id() -> str:
         """Generate a unique entry ID."""
         return f"sp-{uuid.uuid4().hex[:12]}"
 
-    def _get_expiration(self) -> str:
-        """Calculate expiration timestamp based on TTL."""
-        expires = datetime.now(timezone.utc) + timedelta(minutes=self._entry_ttl_minutes)
-        return expires.isoformat()
-
-    def _is_expired(self, entry: ScratchpadEntry) -> bool:
-        """Check if an entry has expired."""
-        try:
-            expires_at = datetime.fromisoformat(entry.expires_at)
-            return datetime.now(timezone.utc) > expires_at
-        except (ValueError, TypeError):
-            return False
-
-    def _cleanup_expired(self) -> int:
-        """Remove expired entries. Returns count of removed entries."""
-        expired_ids = [
-            entry_id for entry_id, entry in self._entries.items()
-            if self._is_expired(entry)
-        ]
-        for entry_id in expired_ids:
-            del self._entries[entry_id]
-            self._enrichment_cache.pop(entry_id, None)
-        return len(expired_ids)
-
-    def _current_token_usage(self) -> int:
-        """Calculate current total token usage."""
-        return sum(entry.minimized_tokens for entry in self._entries.values())
-
-    def _enforce_token_budget(self, needed_tokens: int) -> int:
-        """Evict oldest entries until budget allows needed_tokens.
-
-        Returns count of evicted entries.
-        """
-        evicted = 0
-        current_usage = self._current_token_usage()
-
-        while current_usage + needed_tokens > self._max_tokens and self._entries:
-            # Find oldest entry
-            oldest_entry = min(
-                self._entries.values(),
-                key=lambda e: e.created_at
-            )
-            current_usage -= oldest_entry.minimized_tokens
-            del self._entries[oldest_entry.id]
-            self._enrichment_cache.pop(oldest_entry.id, None)
-            evicted += 1
-
-        return evicted
+    # =========================================================================
+    # LLM OPERATIONS (called on write/ingest only)
+    # =========================================================================
 
     async def _minimize_content(self, content: str) -> Tuple[str, int, int]:
         """Use LLM to minimize content while preserving meaning.
@@ -167,7 +181,6 @@ class ScratchpadStore:
         """
         original_tokens = self._count_tokens(content)
 
-        # Try LLM minimization if configured
         if settings.has_llm_config:
             try:
                 from langchain_openai import AzureChatOpenAI, ChatOpenAI
@@ -189,11 +202,12 @@ class ScratchpadStore:
                         max_tokens=100,
                     )
 
-                prompt = f"""Minimize this text to its essential meaning in as few words as possible.
-Keep key entities, relationships, and facts. Remove filler words.
-Output ONLY the minimized text, nothing else.
-
-Text: {content}"""
+                prompt = (
+                    "Minimize this text to its essential meaning in as few words as possible.\n"
+                    "Keep key entities, relationships, and facts. Remove filler words.\n"
+                    "Output ONLY the minimized text, nothing else.\n\n"
+                    f"Text: {content}"
+                )
 
                 response = await llm.ainvoke(prompt)
                 minimized = response.content.strip()
@@ -204,8 +218,7 @@ Text: {content}"""
                     return minimized, original_tokens, minimized_tokens
 
             except Exception as e:
-                # Fall through to truncation fallback
-                print(f"Scratchpad minimization error (non-fatal): {e}", flush=True)
+                logger.warning("Scratchpad minimization error (non-fatal): %s", e)
 
         # Fallback: truncation to ~75% of original
         if original_tokens > 50:
@@ -217,22 +230,13 @@ Text: {content}"""
 
         return content, original_tokens, original_tokens
 
-    async def _enrich_content(
-        self,
-        entry: ScratchpadEntry,
-        query_context: Optional[str] = None
-    ) -> str:
-        """Use LLM to expand/enrich entry content.
+    async def _enrich_content(self, subject: str, predicate: str, object_: str, content: str) -> Tuple[Optional[str], int]:
+        """Use LLM to expand/enrich entry content on ingest.
 
-        Returns enriched content. Falls back to original content if LLM unavailable.
+        Returns (enriched_content, enriched_tokens). Returns (None, 0) if LLM unavailable.
         """
-        # Check cache first
-        cache_key = entry.id
-        if cache_key in self._enrichment_cache:
-            return self._enrichment_cache[cache_key]
-
         if not settings.has_llm_config:
-            return entry.content
+            return None, 0
 
         try:
             from langchain_openai import AzureChatOpenAI, ChatOpenAI
@@ -254,31 +258,29 @@ Text: {content}"""
                     max_tokens=200,
                 )
 
-            context_note = ""
-            if query_context:
-                context_note = f"\nCurrent query context: {query_context}"
-
-            prompt = f"""Expand this brief note into a more detailed explanation.
-Add relevant context, implications, and connections.
-Keep it concise but informative (2-3 sentences max).
-{context_note}
-
-Subject: {entry.subject}
-Relationship: {entry.predicate}
-Target: {entry.object_}
-Note: {entry.content}"""
+            prompt = (
+                "Expand this brief note into a more detailed explanation.\n"
+                "Add relevant context, implications, and connections.\n"
+                "Keep it concise but informative (2-3 sentences max).\n\n"
+                f"Subject: {subject}\n"
+                f"Relationship: {predicate}\n"
+                f"Target: {object_}\n"
+                f"Note: {content}"
+            )
 
             response = await llm.ainvoke(prompt)
             enriched = response.content.strip()
+            enriched_tokens = self._count_tokens(enriched)
 
-            # Cache the result
-            self._enrichment_cache[cache_key] = enriched
-
-            return enriched
+            return enriched, enriched_tokens
 
         except Exception as e:
-            print(f"Scratchpad enrichment error (non-fatal): {e}", flush=True)
-            return entry.content
+            logger.warning("Scratchpad enrichment error (non-fatal): %s", e)
+            return None, 0
+
+    # =========================================================================
+    # WRITE (with minimize + enrich on ingest)
+    # =========================================================================
 
     async def write(
         self,
@@ -287,9 +289,13 @@ Note: {entry.content}"""
         object_: str,
         content: str,
         minimize: bool = True,
+        enrich: bool = True,
         metadata: Optional[Dict] = None,
     ) -> ScratchpadWriteResult:
-        """Store an observation with optional LLM minimization.
+        """Store an observation with LLM minimization and enrichment on ingest.
+
+        Both minimized and enriched versions are persisted to SQLite.
+        Subsequent reads return cached content — no LLM calls needed.
 
         Args:
             subject: Entity being described (e.g., "WRN-00006")
@@ -297,11 +303,35 @@ Note: {entry.content}"""
             object_: Related entity or concept
             content: The text content to store
             minimize: Whether to use LLM to minimize content (default True)
+            enrich: Whether to use LLM to enrich content (default True)
             metadata: Optional additional properties
 
         Returns:
             ScratchpadWriteResult with the created entry and token savings
         """
+        # Validate required fields
+        if not subject or not subject.strip():
+            return ScratchpadWriteResult(
+                success=False,
+                entry=None,
+                tokens_saved=0,
+                message="subject is required and cannot be empty",
+            )
+        if not object_ or not object_.strip():
+            return ScratchpadWriteResult(
+                success=False,
+                entry=None,
+                tokens_saved=0,
+                message="object_ is required and cannot be empty",
+            )
+        if not content and content != "":
+            return ScratchpadWriteResult(
+                success=False,
+                entry=None,
+                tokens_saved=0,
+                message="content is required",
+            )
+
         # Validate predicate
         if predicate not in VALID_SCRATCHPAD_PREDICATES:
             return ScratchpadWriteResult(
@@ -311,186 +341,214 @@ Note: {entry.content}"""
                 message=f"Invalid predicate '{predicate}'. Must be one of: {', '.join(sorted(VALID_SCRATCHPAD_PREDICATES))}"
             )
 
-        with self._lock:
-            # Clean up expired entries first
-            self._cleanup_expired()
+        # Step 1: Minimize content
+        if minimize:
+            minimized_content, original_tokens, minimized_tokens = await self._minimize_content(content)
+        else:
+            original_tokens = self._count_tokens(content)
+            minimized_content = content
+            minimized_tokens = original_tokens
 
-            # Calculate tokens
-            if minimize:
-                minimized_content, original_tokens, minimized_tokens = await self._minimize_content(content)
-            else:
-                original_tokens = self._count_tokens(content)
-                minimized_content = content
-                minimized_tokens = original_tokens
-
-            # Enforce token budget
-            evicted = self._enforce_token_budget(minimized_tokens)
-            if evicted > 0:
-                print(f"Scratchpad: evicted {evicted} entries to stay within budget", flush=True)
-
-            # Create entry
-            now = datetime.now(timezone.utc).isoformat()
-            entry = ScratchpadEntry(
-                id=self._generate_id(),
-                subject=subject,
-                predicate=predicate,
-                object_=object_,
-                content=minimized_content,
-                original_content=content if minimize and minimized_content != content else None,
-                original_tokens=original_tokens,
-                minimized_tokens=minimized_tokens,
-                enriched_content=None,
-                created_at=now,
-                expires_at=self._get_expiration(),
-                metadata=metadata,
+        # Step 2: Enrich content (on ingest)
+        enriched_content = None
+        enriched_tokens = 0
+        if enrich:
+            enriched_content, enriched_tokens = await self._enrich_content(
+                subject, predicate, object_, content
             )
 
-            self._entries[entry.id] = entry
+        # Step 3: Persist to SQLite
+        now = datetime.now(timezone.utc).isoformat()
+        entry_id = self._generate_id()
+        metadata_json = json.dumps(metadata) if metadata else None
 
-            tokens_saved = original_tokens - minimized_tokens
+        with self._write_lock:
+            with self._get_connection() as conn:
+                conn.execute(
+                    """INSERT INTO entries
+                       (id, subject, predicate, object_, content, original_content,
+                        enriched_content, original_tokens, minimized_tokens,
+                        enriched_tokens, created_at, metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        entry_id, subject, predicate, object_,
+                        minimized_content, content,
+                        enriched_content,
+                        original_tokens, minimized_tokens, enriched_tokens,
+                        now, metadata_json,
+                    ),
+                )
+                conn.commit()
 
-            return ScratchpadWriteResult(
-                success=True,
-                entry=entry,
-                tokens_saved=tokens_saved,
-                message=f"Stored entry (saved {tokens_saved} tokens)" if tokens_saved > 0 else "Stored entry"
-            )
+        entry = ScratchpadEntry(
+            id=entry_id,
+            subject=subject,
+            predicate=predicate,
+            object_=object_,
+            content=minimized_content,
+            original_content=content if minimize and minimized_content != content else None,
+            original_tokens=original_tokens,
+            minimized_tokens=minimized_tokens,
+            enriched_content=enriched_content,
+            enriched_tokens=enriched_tokens,
+            created_at=now,
+            metadata=metadata,
+        )
+
+        tokens_saved = original_tokens - minimized_tokens
+        msg = f"Stored entry (saved {tokens_saved} tokens)" if tokens_saved > 0 else "Stored entry"
+        if enriched_content:
+            msg += " [enriched]"
+
+        return ScratchpadWriteResult(
+            success=True,
+            entry=entry,
+            tokens_saved=tokens_saved,
+            message=msg,
+        )
+
+    # =========================================================================
+    # READ (no LLM calls — returns cached content)
+    # =========================================================================
 
     async def read(
         self,
         subject: Optional[str] = None,
         predicate: Optional[str] = None,
-        enrich: bool = False,
-        query_context: Optional[str] = None,
+        enrich: bool = False,  # DEPRECATED: kept for backward compatibility, ignored
+        query_context: Optional[str] = None,  # DEPRECATED: kept for backward compatibility, ignored
     ) -> ScratchpadReadResult:
-        """Retrieve entries with optional filtering and enrichment.
+        """Retrieve entries from persistent scratchpad memory.
+
+        Entries are returned with their cached enriched_content (populated on write).
+        No LLM calls are made during reads.
 
         Args:
-            subject: Filter by subject (optional)
+            subject: Filter by subject entity (optional)
             predicate: Filter by predicate type (optional)
-            enrich: Whether to use LLM to expand content (default False)
-            query_context: Current query for context-aware enrichment
+            enrich: DEPRECATED — enrichment now happens on write. Kept for backward compat.
+            query_context: DEPRECATED — enrichment now happens on write. Kept for backward compat.
 
         Returns:
             ScratchpadReadResult with matching entries
         """
-        with self._lock:
-            # Clean up expired entries first
-            self._cleanup_expired()
+        conditions = []
+        params: list = []
 
-            # Filter entries
-            entries = list(self._entries.values())
+        if subject:
+            conditions.append("subject = ?")
+            params.append(subject)
 
-            if subject:
-                entries = [e for e in entries if e.subject == subject]
+        if predicate:
+            conditions.append("predicate = ?")
+            params.append(predicate)
 
-            if predicate:
-                entries = [e for e in entries if e.predicate == predicate]
+        where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
 
-            # Sort by creation time (newest first)
-            entries.sort(key=lambda e: e.created_at, reverse=True)
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM entries{where_clause} ORDER BY created_at DESC",
+                params,
+            )
+            rows = cursor.fetchall()
 
-        # Enrich if requested (outside lock to avoid blocking)
-        enriched_count = 0
-        if enrich:
-            for entry in entries:
-                enriched = await self._enrich_content(entry, query_context)
-                entry.enriched_content = enriched
-                enriched_count += 1
+        entries = [self._row_to_entry(row) for row in rows]
 
         return ScratchpadReadResult(
             entries=entries,
             total=len(entries),
-            enriched_count=enriched_count,
         )
+
+    # =========================================================================
+    # CLEAR
+    # =========================================================================
 
     def clear(
         self,
         subject: Optional[str] = None,
-        older_than_minutes: Optional[int] = None,
+        older_than_minutes: Optional[int] = None,  # DEPRECATED: kept for backward compat, ignored
     ) -> ScratchpadClearResult:
-        """Clear entries by subject or age.
+        """Clear entries from persistent scratchpad memory.
 
         Args:
-            subject: Clear only entries for this subject (optional)
-            older_than_minutes: Clear entries older than N minutes (optional)
+            subject: Clear only entries for this subject (optional).
+                     If None, ALL entries are cleared.
+            older_than_minutes: DEPRECATED — no TTL in persistent store. Kept for backward compat.
 
         Returns:
             ScratchpadClearResult with count of cleared entries
         """
-        with self._lock:
-            to_clear = []
-            cutoff_time = None
+        with self._write_lock:
+            with self._get_connection() as conn:
+                if subject:
+                    cursor = conn.execute(
+                        "DELETE FROM entries WHERE subject = ?", (subject,)
+                    )
+                else:
+                    cursor = conn.execute("DELETE FROM entries")
+                conn.commit()
+                cleared = cursor.rowcount
 
-            if older_than_minutes is not None:
-                cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+        return ScratchpadClearResult(
+            cleared_count=cleared,
+            message=f"Cleared {cleared} entries",
+        )
 
-            for entry_id, entry in self._entries.items():
-                should_clear = False
-
-                if subject and entry.subject == subject:
-                    should_clear = True
-                elif cutoff_time:
-                    try:
-                        created = datetime.fromisoformat(entry.created_at)
-                        if created < cutoff_time:
-                            should_clear = True
-                    except (ValueError, TypeError):
-                        pass
-                elif not subject and older_than_minutes is None:
-                    # Clear all if no filters specified
-                    should_clear = True
-
-                if should_clear:
-                    to_clear.append(entry_id)
-
-            for entry_id in to_clear:
-                del self._entries[entry_id]
-                self._enrichment_cache.pop(entry_id, None)
-
-            return ScratchpadClearResult(
-                cleared_count=len(to_clear),
-                message=f"Cleared {len(to_clear)} entries"
-            )
+    # =========================================================================
+    # STATS
+    # =========================================================================
 
     def stats(self) -> ScratchpadStats:
-        """Get scratchpad statistics.
+        """Get scratchpad statistics from SQLite aggregation.
 
         Returns:
-            ScratchpadStats with token usage and entry counts
+            ScratchpadStats with token usage, entry counts, and enrichment metrics
         """
-        with self._lock:
-            # Clean up expired entries first
-            self._cleanup_expired()
+        with self._get_connection() as conn:
+            # Aggregate stats
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) as entry_count,
+                    COALESCE(SUM(original_tokens), 0) as total_original,
+                    COALESCE(SUM(minimized_tokens), 0) as total_minimized,
+                    COALESCE(SUM(enriched_tokens), 0) as total_enriched,
+                    COALESCE(SUM(CASE WHEN enriched_content IS NOT NULL THEN 1 ELSE 0 END), 0) as enriched_count,
+                    COALESCE(SUM(CASE WHEN enriched_content IS NULL THEN 1 ELSE 0 END), 0) as unenriched_count,
+                    MIN(created_at) as oldest,
+                    MAX(created_at) as newest
+                FROM entries
+            """).fetchone()
 
-            entries = list(self._entries.values())
+            # Predicate counts
+            pred_rows = conn.execute(
+                "SELECT predicate, COUNT(*) as cnt FROM entries GROUP BY predicate"
+            ).fetchall()
+            predicate_counts = {r["predicate"]: r["cnt"] for r in pred_rows}
 
-            total_original = sum(e.original_tokens for e in entries)
-            total_minimized = sum(e.minimized_tokens for e in entries)
-            tokens_saved = total_original - total_minimized
+        entry_count = row["entry_count"]
+        total_original = row["total_original"]
+        total_minimized = row["total_minimized"]
+        tokens_saved = total_original - total_minimized
+        savings_pct = (tokens_saved / total_original * 100) if total_original > 0 else 0.0
 
-            savings_pct = (tokens_saved / total_original * 100) if total_original > 0 else 0.0
+        return ScratchpadStats(
+            entry_count=entry_count,
+            total_original_tokens=total_original,
+            total_minimized_tokens=total_minimized,
+            total_enriched_tokens=row["total_enriched"],
+            tokens_saved=tokens_saved,
+            savings_percentage=round(savings_pct, 1),
+            enriched_count=row["enriched_count"],
+            unenriched_count=row["unenriched_count"],
+            predicate_counts=predicate_counts,
+            oldest_entry=row["oldest"],
+            newest_entry=row["newest"],
+            db_path=str(self.db_path),
+        )
 
-            predicate_counts = {}
-            for entry in entries:
-                predicate_counts[entry.predicate] = predicate_counts.get(entry.predicate, 0) + 1
-
-            oldest = min((e.created_at for e in entries), default=None)
-            newest = max((e.created_at for e in entries), default=None)
-
-            return ScratchpadStats(
-                entry_count=len(entries),
-                total_original_tokens=total_original,
-                total_minimized_tokens=total_minimized,
-                tokens_saved=tokens_saved,
-                savings_percentage=round(savings_pct, 1),
-                token_budget=self._max_tokens,
-                token_budget_used=total_minimized,
-                token_budget_remaining=self._max_tokens - total_minimized,
-                predicate_counts=predicate_counts,
-                oldest_entry=oldest,
-                newest_entry=newest,
-            )
+    # =========================================================================
+    # CONTEXT INJECTION (for LangGraph pipeline)
+    # =========================================================================
 
     def get_context_for_injection(
         self,
@@ -500,44 +558,115 @@ Note: {entry.content}"""
         """Get formatted context lines for LangGraph injection.
 
         Returns entries formatted as context lines, respecting token budget.
-        Entries are sorted by recency (newest first) and formatted as:
-        "[predicate] subject -> object_: content"
+        Entries are sorted by recency (newest first). Prefers enriched_content
+        over minimized content when available.
+
+        Format: "[predicate] subject -> object_: content"
 
         Args:
             token_budget: Maximum tokens to use (default from settings)
-            query_context: Optional query for relevance filtering
+            query_context: Optional query for relevance filtering (future use)
 
         Returns:
             Tuple of (context_lines, total_tokens)
         """
-        budget = token_budget or self._inject_budget
+        budget = token_budget or settings.scratchpad_inject_budget
 
-        with self._lock:
-            # Clean up expired entries first
-            self._cleanup_expired()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT subject, predicate, object_, content, enriched_content FROM entries ORDER BY created_at DESC"
+            ).fetchall()
 
-            # Sort by recency (newest first)
-            entries = sorted(
-                self._entries.values(),
-                key=lambda e: e.created_at,
-                reverse=True
+        context_lines: list[str] = []
+        total_tokens = 0
+
+        for row in rows:
+            # Prefer enriched content for injection
+            text = row["enriched_content"] if row["enriched_content"] else row["content"]
+            line = f"[{row['predicate']}] {row['subject']} -> {row['object_']}: {text}"
+            line_tokens = self._count_tokens(line)
+
+            if total_tokens + line_tokens <= budget:
+                context_lines.append(line)
+                total_tokens += line_tokens
+            else:
+                break
+
+        return context_lines, total_tokens
+
+    # =========================================================================
+    # BACKFILL (fill enrichment gaps for entries written without LLM)
+    # =========================================================================
+
+    async def backfill_enrichments(self, limit: int = 50) -> int:
+        """Backfill enrichment for entries that were stored without enrichment.
+
+        Useful when LLM was unavailable during initial write. Processes
+        oldest unenriched entries first.
+
+        Args:
+            limit: Maximum entries to backfill in one call
+
+        Returns:
+            Number of entries enriched
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM entries WHERE enriched_content IS NULL ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        enriched_count = 0
+        for row in rows:
+            enriched_content, enriched_tokens = await self._enrich_content(
+                row["subject"], row["predicate"], row["object_"], row["original_content"]
             )
+            if enriched_content:
+                with self._write_lock:
+                    with self._get_connection() as conn:
+                        conn.execute(
+                            "UPDATE entries SET enriched_content = ?, enriched_tokens = ? WHERE id = ?",
+                            (enriched_content, enriched_tokens, row["id"]),
+                        )
+                        conn.commit()
+                enriched_count += 1
 
-            context_lines = []
-            total_tokens = 0
+        return enriched_count
 
-            for entry in entries:
-                line = f"[{entry.predicate}] {entry.subject} -> {entry.object_}: {entry.content}"
-                line_tokens = self._count_tokens(line)
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
 
-                if total_tokens + line_tokens <= budget:
-                    context_lines.append(line)
-                    total_tokens += line_tokens
-                else:
-                    # Budget exceeded, stop adding
-                    break
+    def _row_to_entry(self, row: sqlite3.Row) -> ScratchpadEntry:
+        """Convert a SQLite row to a ScratchpadEntry."""
+        metadata = json.loads(row["metadata"]) if row["metadata"] else None
+        return ScratchpadEntry(
+            id=row["id"],
+            subject=row["subject"],
+            predicate=row["predicate"],
+            object_=row["object_"],
+            content=row["content"],
+            original_content=row["original_content"],
+            original_tokens=row["original_tokens"],
+            minimized_tokens=row["minimized_tokens"],
+            enriched_content=row["enriched_content"],
+            enriched_tokens=row["enriched_tokens"],
+            created_at=row["created_at"],
+            metadata=metadata,
+        )
 
-            return context_lines, total_tokens
+    def close(self) -> None:
+        """Close the database connection for the current thread."""
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
+    def __del__(self) -> None:
+        """Clean up thread-local connection on garbage collection."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -566,9 +695,11 @@ def get_scratchpad_store() -> ScratchpadStore:
 def reset_scratchpad_store() -> None:
     """Reset the scratchpad store (useful for testing).
 
-    Creates a new empty store instance.
+    Closes the existing store and creates a new empty instance.
     """
     global _scratchpad_store
 
     with _scratchpad_lock:
+        if _scratchpad_store is not None:
+            _scratchpad_store.close()
         _scratchpad_store = ScratchpadStore()

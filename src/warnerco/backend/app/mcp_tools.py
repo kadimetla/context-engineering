@@ -12,6 +12,7 @@ MCP Primitives Implemented:
 2. RESOURCES (@mcp.resource) - Data sources the LLM can read (static and templated)
 3. PROMPTS (@mcp.prompt) - Reusable prompt templates for common tasks
 4. ELICITATIONS (ctx.elicit) - Interactive user input during tool execution
+5. SAMPLING (ctx.sample) - Server-initiated LLM completions for enrichment
 
 Key Concepts:
 -------------
@@ -19,6 +20,7 @@ Key Concepts:
 - Resources are for DATA (read-only content)
 - Prompts are for TEMPLATES (reusable instructions)
 - Elicitations are for INTERACTION (multi-turn dialogs)
+- Sampling is for ENRICHMENT (server asks LLM to generate content)
 
 FastMCP automatically generates JSON schemas from Python type hints and docstrings,
 making tools self-documenting and type-safe.
@@ -188,6 +190,58 @@ class FeedbackResult(BaseModel):
     acknowledged: bool = Field(description="Whether feedback was recorded")
 
 
+class ReplacementCandidate(BaseModel):
+    """A single replacement candidate with relevance and compatibility info."""
+
+    id: str = Field(description="Schematic ID of the candidate replacement")
+    model: str = Field(description="Robot model of the candidate")
+    name: str = Field(description="Robot name")
+    component: str = Field(description="Component name")
+    category: str = Field(description="Component category")
+    status: str = Field(description="Current status (active, deprecated, etc.)")
+    score: float = Field(description="Relevance score from semantic search (0-1)")
+    compatibility_note: str = Field(
+        description="Note on compatibility (from graph relationships or constraint matching)"
+    )
+
+
+class ReplacementAdvisorResult(BaseModel):
+    """Result of the replacement advisor wizard.
+
+    Combines the user's stated needs (from elicitation) with automated
+    search results (from semantic search and graph queries) into a
+    structured recommendation report.
+    """
+
+    # Original schematic context
+    original_id: str = Field(description="Schematic ID of the component being replaced")
+    original_component: str = Field(description="Name of the component being replaced")
+    original_category: str = Field(description="Category of the component being replaced")
+    original_model: str = Field(description="Robot model of the component being replaced")
+
+    # User's stated needs (from elicitation Steps 1 and 2)
+    reason: str = Field(description="User's stated reason for replacement")
+    urgency: str = Field(description="How urgently the replacement is needed")
+    additional_context: Optional[str] = Field(
+        default=None, description="Extra context provided by user"
+    )
+    must_match_category: bool = Field(description="Whether category must match")
+    must_match_model: bool = Field(description="Whether model must match")
+    budget_priority: str = Field(description="Cost vs. performance priority")
+
+    # Recommendations (from search + graph)
+    candidates: List[ReplacementCandidate] = Field(
+        description="Ranked replacement candidates from semantic search"
+    )
+    graph_compatible: List[str] = Field(
+        description="Schematic IDs with explicit compatible_with graph relationships"
+    )
+
+    # Session metadata
+    session_summary: str = Field(description="Human-readable summary of the advisory session")
+    completed: bool = Field(description="Whether the wizard completed (False if user cancelled)")
+
+
 # =============================================================================
 # CRUD OPERATION RESULT MODELS
 # =============================================================================
@@ -282,6 +336,69 @@ class FeedbackInput(BaseModel):
     )
     would_recommend: bool = Field(
         description="Would you recommend this schematic to others?",
+    )
+
+
+class ReplacementReasonInput(BaseModel):
+    """Schema for Step 1 of the replacement advisor: why the component needs replacing.
+
+    Multi-step elicitation lets the tool gather information progressively,
+    keeping each step focused and easy to answer. This is more effective than
+    a single large form because each step can adapt based on prior answers.
+    """
+
+    reason: str = Field(
+        description="Primary reason for seeking a replacement component",
+        json_schema_extra={
+            "enum": [
+                "deprecated",
+                "performance_degradation",
+                "end_of_life",
+                "cost_reduction",
+                "compatibility_issue",
+            ]
+        },
+    )
+    urgency: str = Field(
+        description="How urgently the replacement is needed",
+        json_schema_extra={
+            "enum": [
+                "critical_immediate",
+                "planned_maintenance",
+                "future_upgrade",
+            ]
+        },
+    )
+    additional_context: Optional[str] = Field(
+        default=None,
+        description="Any extra details about the replacement need (failure symptoms, timeline, etc.)",
+        max_length=1000,
+    )
+
+
+class ReplacementConstraintsInput(BaseModel):
+    """Schema for Step 2 of the replacement advisor: constraints on the replacement.
+
+    Separating constraints from the reason lets the user think about each
+    concern independently. This two-step pattern is common in wizard-style
+    elicitations where decisions build on each other.
+    """
+
+    must_match_category: bool = Field(
+        description="Must the replacement be in the same component category (e.g., sensors, power)?",
+    )
+    must_match_model: bool = Field(
+        description="Must the replacement be compatible with the same robot model?",
+    )
+    budget_priority: str = Field(
+        description="How to balance cost vs. performance in recommendations",
+        json_schema_extra={
+            "enum": [
+                "cost_sensitive",
+                "balanced",
+                "performance_first",
+            ]
+        },
     )
 
 
@@ -1518,6 +1635,321 @@ async def warn_feedback_loop(ctx: Context, schematic_id: str) -> FeedbackResult:
     )
 
 
+@mcp.tool()
+async def warn_replacement_advisor(
+    schematic_id: str,
+    # FastMCP automatically injects the Context parameter - it is NOT exposed
+    # as a tool parameter in the JSON schema sent to the LLM. The framework
+    # detects the Context type hint and provides the runtime context object.
+    ctx: Context,
+) -> ReplacementAdvisorResult:
+    """Interactive component replacement wizard using multi-step elicitation.
+
+    Guides a robotics engineer through a structured replacement workflow:
+    1. **Why** — Elicit the reason and urgency for replacement
+    2. **Constraints** — Elicit technical and budget constraints
+    3. **Recommend** — Search for candidates using semantic search + graph
+
+    This tool demonstrates multi-step elicitation — unlike a single-form
+    approach (see warn_feedback_loop), multi-step elicitation lets each
+    step adapt to prior answers and keeps each interaction focused. This
+    is ideal for complex workflows where gathering all inputs at once would
+    overwhelm the user.
+
+    Compared to other MCP primitives:
+    - **Tools** execute actions (this tool orchestrates an advisory workflow)
+    - **Resources** provide read-only data (this tool needs user interaction)
+    - **Prompts** are templates (this tool has dynamic, branching logic)
+    - **Sampling** asks the LLM to generate content (this tool asks the *user*)
+    - **Elicitation** (ctx.elicit) requests structured input from the user
+
+    Args:
+        schematic_id: The ID of the component to find a replacement for
+            (e.g., "WRN-00001"). Must be a valid schematic in the system.
+        ctx: MCP Context object (automatically injected by FastMCP).
+            Provides access to elicit(), logging, and progress reporting.
+
+    Returns:
+        ReplacementAdvisorResult containing:
+            - Original schematic info (id, component, category, model)
+            - User's stated reason, urgency, and constraints
+            - Ranked replacement candidates from semantic search
+            - Graph-based compatibility matches (if any)
+            - Session summary string
+
+    Example:
+        When invoked with a schematic ID, the tool will interactively prompt:
+        1. "Why does this component need replacing?" (reason + urgency)
+        2. "What constraints apply?" (category match, model match, budget)
+        Then it searches for and ranks replacement candidates.
+    """
+    memory = get_memory_store()
+
+    # ------------------------------------------------------------------
+    # Validate the schematic exists before starting the wizard
+    # ------------------------------------------------------------------
+    schematic = await memory.get_schematic(schematic_id)
+    if not schematic:
+        return ReplacementAdvisorResult(
+            original_id=schematic_id,
+            original_component="unknown",
+            original_category="unknown",
+            original_model="unknown",
+            reason="",
+            urgency="",
+            additional_context=None,
+            must_match_category=False,
+            must_match_model=False,
+            budget_priority="",
+            candidates=[],
+            graph_compatible=[],
+            session_summary=f"Schematic '{schematic_id}' not found. Cannot advise on replacement.",
+            completed=False,
+        )
+
+    original_component = schematic.component
+    original_category = schematic.category
+    original_model = schematic.model
+
+    await ctx.info(
+        f"Starting replacement advisor for {schematic_id}: "
+        f"{original_component} ({original_category}, {original_model})"
+    )
+
+    # ------------------------------------------------------------------
+    # Step 1: Elicit the reason for replacement
+    # ------------------------------------------------------------------
+    # Multi-step elicitation: each step is a separate ctx.elicit() call
+    # with its own Pydantic schema. This keeps each form small and focused.
+    await ctx.info("Step 1/3: Reason for replacement")
+    reason_result = await ctx.elicit(
+        message=(
+            f"Component replacement advisor for {schematic_id}:\n"
+            f"  Component: {original_component}\n"
+            f"  Category: {original_category}\n"
+            f"  Model: {original_model}\n\n"
+            "Why does this component need replacing?"
+        ),
+        schema=ReplacementReasonInput,
+    )
+
+    # Handle cancellation — always check .action before accessing .data
+    if reason_result.action != "submit":
+        await ctx.info("Replacement advisor cancelled at Step 1 (reason)")
+        return ReplacementAdvisorResult(
+            original_id=schematic_id,
+            original_component=original_component,
+            original_category=original_category,
+            original_model=original_model,
+            reason="",
+            urgency="",
+            additional_context=None,
+            must_match_category=False,
+            must_match_model=False,
+            budget_priority="",
+            candidates=[],
+            graph_compatible=[],
+            session_summary="Replacement advisor cancelled by user at reason selection.",
+            completed=False,
+        )
+
+    reason = reason_result.data.reason
+    urgency = reason_result.data.urgency
+    additional_context = reason_result.data.additional_context
+
+    await ctx.info(f"Reason: {reason}, Urgency: {urgency}")
+
+    # ------------------------------------------------------------------
+    # Step 2: Elicit replacement constraints
+    # ------------------------------------------------------------------
+    await ctx.info("Step 2/3: Replacement constraints")
+    constraints_result = await ctx.elicit(
+        message=(
+            f"Replacing: {original_component} (reason: {reason}, urgency: {urgency})\n\n"
+            "What constraints should guide the replacement search?"
+        ),
+        schema=ReplacementConstraintsInput,
+    )
+
+    if constraints_result.action != "submit":
+        await ctx.info("Replacement advisor cancelled at Step 2 (constraints)")
+        return ReplacementAdvisorResult(
+            original_id=schematic_id,
+            original_component=original_component,
+            original_category=original_category,
+            original_model=original_model,
+            reason=reason,
+            urgency=urgency,
+            additional_context=additional_context,
+            must_match_category=False,
+            must_match_model=False,
+            budget_priority="",
+            candidates=[],
+            graph_compatible=[],
+            session_summary="Replacement advisor cancelled by user at constraint selection.",
+            completed=False,
+        )
+
+    must_match_category = constraints_result.data.must_match_category
+    must_match_model = constraints_result.data.must_match_model
+    budget_priority = constraints_result.data.budget_priority
+
+    await ctx.info(
+        f"Constraints: category_match={must_match_category}, "
+        f"model_match={must_match_model}, budget={budget_priority}"
+    )
+
+    # ------------------------------------------------------------------
+    # Step 3: Search and recommend replacements
+    # ------------------------------------------------------------------
+    await ctx.info("Step 3/3: Searching for replacement candidates")
+
+    # Build a search query from the original schematic and user context
+    context_phrase = f" ({additional_context})" if additional_context else ""
+    search_query = (
+        f"replacement for {original_component} {original_category} component"
+        f"{context_phrase}"
+    )
+
+    # Apply filters based on user constraints
+    filters: Dict[str, str] = {}
+    if must_match_category:
+        filters["category"] = original_category
+    if must_match_model:
+        filters["model"] = original_model
+
+    # Run semantic search through the LangGraph pipeline
+    search_result = await run_query(
+        query=search_query,
+        filters=filters if filters else None,
+        top_k=10,
+    )
+
+    # Transform raw results into ReplacementCandidate models
+    # Use list comprehension (immutable pattern) instead of .append()
+    raw_results = search_result.get("results", [])
+
+    # Exclude the original schematic from candidates — you don't want
+    # to recommend replacing a component with itself
+    candidates = [
+        ReplacementCandidate(
+            id=r.get("id", ""),
+            model=r.get("model", ""),
+            name=r.get("name", ""),
+            component=r.get("component", ""),
+            category=r.get("category", original_category),
+            status=r.get("status", "unknown"),
+            score=r.get("score", 0.0),
+            compatibility_note=(
+                "Same category and model"
+                if r.get("category") == original_category and r.get("model") == original_model
+                else "Same category"
+                if r.get("category") == original_category
+                else "Cross-category candidate"
+            ),
+        )
+        for r in raw_results
+        if r.get("id", "") != schematic_id
+    ]
+
+    # Sort by score descending, then apply budget priority heuristic:
+    # - cost_sensitive: prefer active (lower risk) components first
+    # - performance_first: keep pure score ranking
+    # - balanced: default score ranking
+    if budget_priority == "cost_sensitive":
+        candidates = sorted(
+            candidates,
+            key=lambda c: (0 if c.status == "active" else 1, -c.score),
+        )
+    else:
+        candidates = sorted(candidates, key=lambda c: -c.score)
+
+    # ------------------------------------------------------------------
+    # Graph-based compatibility lookup (graceful degradation)
+    # ------------------------------------------------------------------
+    # The knowledge graph may have explicit "compatible_with" edges that
+    # supplement the semantic search results. Graph failures should never
+    # block the tool — we degrade gracefully to search-only results.
+    graph_compatible: List[str] = []
+    try:
+        from app.adapters.graph_store import get_graph_store
+
+        graph_store = get_graph_store()
+        outgoing_rels = await graph_store.get_related(schematic_id)
+
+        # Also check incoming compatible_with edges (compatibility is often bidirectional)
+        incoming_rels = await graph_store.get_subjects(schematic_id)
+
+        # Use sets for O(1) deduplication instead of O(n) list scans
+        outgoing_ids = {rel.object for rel in outgoing_rels if rel.predicate == "compatible_with"}
+        incoming_ids = {rel.subject for rel in incoming_rels if rel.predicate == "compatible_with"}
+        graph_compatible = list(outgoing_ids | incoming_ids)
+
+        if graph_compatible:
+            await ctx.info(
+                f"Found {len(graph_compatible)} graph-based compatibility matches"
+            )
+
+            # Annotate candidates that also appear in graph compatibility
+            candidates = [
+                ReplacementCandidate(
+                    id=c.id,
+                    model=c.model,
+                    name=c.name,
+                    component=c.component,
+                    category=c.category,
+                    status=c.status,
+                    score=c.score,
+                    compatibility_note=(
+                        f"{c.compatibility_note} + graph-verified compatible"
+                        if c.id in graph_compatible
+                        else c.compatibility_note
+                    ),
+                )
+                for c in candidates
+            ]
+
+    except Exception as e:
+        # Graph store may not be available — this is expected in some
+        # configurations (e.g., json-only memory backend without graph.db)
+        await ctx.info(f"Graph lookup skipped (non-critical): {str(e)}")
+
+    # ------------------------------------------------------------------
+    # Build session summary
+    # ------------------------------------------------------------------
+    constraint_parts = [
+        f"category_match={must_match_category}",
+        f"model_match={must_match_model}",
+        f"budget={budget_priority}",
+    ]
+    session_summary = (
+        f"Replacement advisor completed for {schematic_id} ({original_component}). "
+        f"Reason: {reason}, Urgency: {urgency}. "
+        f"Constraints: {', '.join(constraint_parts)}. "
+        f"Found {len(candidates)} candidate(s)"
+        + (f" and {len(graph_compatible)} graph-verified compatible component(s)." if graph_compatible else ".")
+    )
+
+    await ctx.info(session_summary)
+
+    return ReplacementAdvisorResult(
+        original_id=schematic_id,
+        original_component=original_component,
+        original_category=original_category,
+        original_model=original_model,
+        reason=reason,
+        urgency=urgency,
+        additional_context=additional_context,
+        must_match_category=must_match_category,
+        must_match_model=must_match_model,
+        budget_priority=budget_priority,
+        candidates=candidates,
+        graph_compatible=graph_compatible,
+        session_summary=session_summary,
+        completed=True,
+    )
+
+
 # =============================================================================
 # RESOURCES - Read-Only Data Sources
 # =============================================================================
@@ -2055,6 +2487,39 @@ Collect user feedback on a schematic.
 
 ---
 
+### `warn_replacement_advisor`
+
+Interactive component replacement wizard using multi-step elicitation.
+
+**Parameters**:
+- `schematic_id` (required, string): Component schematic to find a replacement for
+
+**Returns**: ReplacementAdvisorResult with ranked candidates, user constraints, and graph compatibility
+
+---
+
+## Sampling Tools (Server-Initiated LLM Completion)
+
+### `warn_explain_schematic`
+
+Get an LLM-enriched explanation of a robot schematic. The server fetches raw
+data (schematic + graph relationships) and asks the client's LLM to generate
+a structured, audience-appropriate explanation.
+
+**Parameters**:
+- `schematic_id` (required, string): Schematic ID to explain
+- `audience` (optional, string): Target audience - "technical" (default), "executive", or "field_technician"
+- `include_graph_context` (optional, bool): Include knowledge graph relationships (default: true)
+
+**Returns**: SchematicExplainerResult with LLM-generated explanation including:
+  plain_language_summary, key_capabilities, typical_failure_modes,
+  maintenance_tips, integration_notes, safety_considerations
+
+**MCP Primitive**: This tool uses `ctx.sample()` to request LLM completions
+from the client. The server provides data context; the LLM provides reasoning.
+
+---
+
 *Server Version: {SERVER_VERSION}*
 """
 
@@ -2298,10 +2763,11 @@ The WARNERCO Schematica MCP server provides access to robot schematic
 documentation through the Model Context Protocol. It demonstrates all
 MCP primitives:
 
-- **15 Tools** - Executable functions for data retrieval, modification, and interaction
+- **17 Tools** - Executable functions for data retrieval, modification, and interaction
 - **10 Resources** - Read-only data sources (static and templated)
 - **5 Prompts** - Reusable prompt templates
 - **2 Elicitation Tools** - Interactive user input (included in tool count)
+- **1 Sampling Tool** - Server-initiated LLM completion (included in tool count)
 
 ---
 
@@ -2320,6 +2786,8 @@ MCP primitives:
 | `warn_compare_schematics` | Side-by-side comparison |
 | `warn_guided_search` | Interactive guided search |
 | `warn_feedback_loop` | Collect user feedback |
+| `warn_replacement_advisor` | Component replacement wizard (elicitation) |
+| `warn_explain_schematic` | LLM-enriched schematic explanation (sampling) |
 
 ---
 
@@ -2381,29 +2849,32 @@ Access resource: `schematic://WRN-00001`
                     |   MCP Client (LLM)    |
                     +-----------+-----------+
                                 |
-                                v
+                       (tools, resources,     ^ (sampling: server
+                        prompts, elicit)      |  asks LLM to enrich)
+                                |             |
+                                v             |
 +-----------------------------------------------------------------------------------+
 |                        FastMCP Server (warnerco-schematica)                       |
 +-----------------------------------------------------------------------------------+
-|  Tools              |  Resources          |  Prompts            |  Elicitations   |
-|  - list_robots      |  - memory://        |  - diagnostic       |  - guided       |
-|  - get_robot        |  - schematic://     |  - comparison       |  - feedback     |
-|  - semantic_search  |  - catalog://       |  - search_strategy  |                 |
-|  - memory_stats     |  - help://          |  - maintenance      |                 |
-|  - index_schematic  |  - mcp://           |  - schematic_review |                 |
-|  - compare          |                     |                     |                 |
+|  Tools              |  Resources      |  Prompts        | Elicit  |  Sampling     |
+|  - list_robots      |  - memory://    |  - diagnostic   | guided  | explain_      |
+|  - get_robot        |  - schematic:// |  - comparison   | feedbk  |  schematic    |
+|  - semantic_search  |  - catalog://   |  - search_strat |         | (ctx.sample)  |
+|  - memory_stats     |  - help://      |  - maintenance  |         |               |
+|  - index_schematic  |  - mcp://       |  - review       |         |               |
 +-----------------------------------------------------------------------------------+
                                 |
                                 v
 +-----------------------------------------------------------------------------------+
-|                      LangGraph RAG Pipeline (5 nodes)                             |
-|  parse_intent -> retrieve -> compress_context -> reason -> respond                |
+|                      LangGraph RAG Pipeline (7 nodes)                             |
+|  parse_intent -> query_graph -> inject_scratchpad -> retrieve                     |
+|  -> compress_context -> reason -> respond                                         |
 +-----------------------------------------------------------------------------------+
                                 |
                                 v
 +-----------------------------------------------------------------------------------+
-|                      3-Tier Memory Backend                                        |
-|  JSON (dev) <-> Chroma (staging) <-> Azure AI Search (production)                 |
+|                      Hybrid Memory Layer                                          |
+|  Vector (JSON/Chroma/Azure) + Graph (SQLite/NetworkX) + Scratchpad (In-Memory)    |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -3295,9 +3766,10 @@ async def warn_graph_stats() -> GraphStatsResult:
 # =============================================================================
 # SCRATCHPAD MEMORY TOOLS
 # =============================================================================
-# Tools for session-scoped working memory. The scratchpad complements the
-# vector (Chroma) and graph (SQLite + NetworkX) memory layers with ephemeral,
-# session-scoped storage for observations and inferences.
+# Tools for persistent working memory. The scratchpad complements the
+# vector (Chroma) and graph (SQLite + NetworkX) memory layers with
+# SQLite-backed persistent storage for observations and inferences.
+# LLM minimization and enrichment both happen on write (ingest).
 
 
 class ScratchpadWriteToolResult(BaseModel):
@@ -3308,6 +3780,8 @@ class ScratchpadWriteToolResult(BaseModel):
     tokens_saved: int = Field(default=0, description="Tokens saved by minimization")
     original_tokens: int = Field(default=0, description="Original token count")
     minimized_tokens: int = Field(default=0, description="Token count after minimization")
+    enriched: bool = Field(default=False, description="Whether content was enriched on ingest")
+    enriched_tokens: int = Field(default=0, description="Token count of enriched content")
     message: str = Field(description="Status message")
 
 
@@ -3316,7 +3790,6 @@ class ScratchpadReadToolResult(BaseModel):
 
     entries: List[Dict[str, Any]] = Field(default_factory=list, description="Matching entries")
     total: int = Field(description="Total entries matching filters")
-    enriched_count: int = Field(default=0, description="Number of entries that were enriched")
 
 
 class ScratchpadClearToolResult(BaseModel):
@@ -3327,17 +3800,18 @@ class ScratchpadClearToolResult(BaseModel):
 
 
 class ScratchpadStatsToolResult(BaseModel):
-    """Statistics about the scratchpad memory."""
+    """Statistics about the persistent scratchpad memory."""
 
     entry_count: int = Field(description="Total number of entries")
     total_original_tokens: int = Field(description="Sum of original token counts")
     total_minimized_tokens: int = Field(description="Sum of minimized token counts")
+    total_enriched_tokens: int = Field(description="Sum of enriched token counts")
     tokens_saved: int = Field(description="Tokens saved through minimization")
     savings_percentage: float = Field(description="Percentage of tokens saved")
-    token_budget: int = Field(description="Maximum allowed tokens")
-    token_budget_used: int = Field(description="Current tokens used")
-    token_budget_remaining: int = Field(description="Remaining token budget")
+    enriched_count: int = Field(description="Number of entries with enrichment")
+    unenriched_count: int = Field(description="Number of entries without enrichment")
     predicate_counts: Dict[str, int] = Field(default_factory=dict, description="Count by predicate type")
+    db_path: str = Field(description="Path to the SQLite database")
 
 
 @mcp.tool()
@@ -3347,15 +3821,19 @@ async def warn_scratchpad_write(
     object_: str,
     content: str,
     minimize: bool = True,
+    enrich: bool = True,
 ) -> ScratchpadWriteToolResult:
-    """Store an observation or inference in the session-scoped scratchpad memory.
+    """Store an observation or inference in the persistent scratchpad memory.
 
-    The scratchpad provides ephemeral working memory for the current session.
-    Unlike the persistent vector and graph stores, scratchpad entries expire
-    after 30 minutes and are cleared when the session ends.
+    The scratchpad provides persistent memory backed by SQLite. Entries survive
+    server restarts and persist until explicitly deleted.
 
-    When minimize=True (default), the content is compressed using an LLM to
-    reduce token usage while preserving essential meaning.
+    On write (ingest), the content is processed in two stages:
+    1. Minimization (minimize=True): LLM compresses content to reduce tokens
+    2. Enrichment (enrich=True): LLM expands content with context and implications
+
+    All three versions (original, minimized, enriched) are persisted. Reads
+    return cached content with no additional LLM calls.
 
     Args:
         subject: The entity being described (e.g., "WRN-00006", "query:thermal")
@@ -3370,6 +3848,7 @@ async def warn_scratchpad_write(
         object_: Related entity or concept (e.g., "thermal_system", "issue")
         content: The text content to store
         minimize: Whether to use LLM to compress content (default: True)
+        enrich: Whether to use LLM to enrich content on ingest (default: True)
 
     Returns:
         ScratchpadWriteToolResult containing:
@@ -3378,6 +3857,8 @@ async def warn_scratchpad_write(
             - tokens_saved: Tokens saved by minimization
             - original_tokens: Token count before minimization
             - minimized_tokens: Token count after minimization
+            - enriched: Whether content was enriched
+            - enriched_tokens: Token count of enriched content
             - message: Status message
 
     Example:
@@ -3388,7 +3869,7 @@ async def warn_scratchpad_write(
         ...     object_="thermal_system",
         ...     content="WRN-00006 has thermal issues when running hydraulics"
         ... )
-        >>> print(f"Saved {result.tokens_saved} tokens")
+        >>> print(f"Saved {result.tokens_saved} tokens, enriched={result.enriched}")
     """
     from app.adapters.scratchpad_store import get_scratchpad_store
 
@@ -3400,6 +3881,7 @@ async def warn_scratchpad_write(
             object_=object_,
             content=content,
             minimize=minimize,
+            enrich=enrich,
         )
 
         if result.success and result.entry:
@@ -3409,6 +3891,8 @@ async def warn_scratchpad_write(
                 tokens_saved=result.tokens_saved,
                 original_tokens=result.entry.original_tokens,
                 minimized_tokens=result.entry.minimized_tokens,
+                enriched=result.entry.enriched_content is not None,
+                enriched_tokens=result.entry.enriched_tokens,
                 message=result.message,
             )
         else:
@@ -3418,6 +3902,8 @@ async def warn_scratchpad_write(
                 tokens_saved=0,
                 original_tokens=0,
                 minimized_tokens=0,
+                enriched=False,
+                enriched_tokens=0,
                 message=result.message,
             )
 
@@ -3430,6 +3916,8 @@ async def warn_scratchpad_write(
             tokens_saved=0,
             original_tokens=0,
             minimized_tokens=0,
+            enriched=False,
+            enriched_tokens=0,
             message=f"Error: {str(e)}",
         )
 
@@ -3440,23 +3928,22 @@ async def warn_scratchpad_read(
     predicate: Optional[str] = None,
     enrich: bool = False,
 ) -> ScratchpadReadToolResult:
-    """Retrieve entries from the session-scoped scratchpad memory.
+    """Retrieve entries from the persistent scratchpad memory.
 
-    Entries can be filtered by subject and/or predicate. When enrich=True,
-    the content is expanded using an LLM to provide more detailed context.
+    Entries are returned with their cached enriched_content (populated on write).
+    No LLM calls are made during reads.
 
     Args:
         subject: Filter by subject entity (optional)
         predicate: Filter by predicate type (optional). Valid predicates:
             observed, inferred, relevant_to, summarized_as, contradicts,
             supersedes, depends_on
-        enrich: Whether to use LLM to expand content (default: False)
+        enrich: DEPRECATED — enrichment now happens on write. Kept for backward compat.
 
     Returns:
         ScratchpadReadToolResult containing:
             - entries: List of matching entries with content
             - total: Total number of matching entries
-            - enriched_count: Number of entries that were enriched
 
     Example:
         >>> # Read all observations about WRN-00006
@@ -3471,27 +3958,29 @@ async def warn_scratchpad_read(
         result = await scratchpad.read(
             subject=subject,
             predicate=predicate,
-            enrich=enrich,
         )
 
-        entries = []
-        for entry in result.entries:
-            entries.append({
+        entries = [
+            {
                 "id": entry.id,
                 "subject": entry.subject,
                 "predicate": entry.predicate,
                 "object": entry.object_,
                 "content": entry.enriched_content if entry.enriched_content else entry.content,
+                "original_content": entry.original_content,
+                "minimized_content": entry.content,
+                "enriched_content": entry.enriched_content,
                 "original_tokens": entry.original_tokens,
                 "minimized_tokens": entry.minimized_tokens,
+                "enriched_tokens": entry.enriched_tokens,
                 "created_at": entry.created_at,
-                "expires_at": entry.expires_at,
-            })
+            }
+            for entry in result.entries
+        ]
 
         return ScratchpadReadToolResult(
             entries=entries,
             total=result.total,
-            enriched_count=result.enriched_count,
         )
 
     except Exception as e:
@@ -3500,7 +3989,6 @@ async def warn_scratchpad_read(
         return ScratchpadReadToolResult(
             entries=[],
             total=0,
-            enriched_count=0,
         )
 
 
@@ -3509,14 +3997,14 @@ async def warn_scratchpad_clear(
     subject: Optional[str] = None,
     older_than_minutes: Optional[int] = None,
 ) -> ScratchpadClearToolResult:
-    """Clear entries from the session-scoped scratchpad memory.
+    """Clear entries from the persistent scratchpad memory.
 
-    Entries can be cleared by subject or by age. If neither parameter is
-    provided, ALL entries are cleared.
+    Entries can be cleared by subject. If no subject is provided,
+    ALL entries are cleared from the SQLite database.
 
     Args:
         subject: Clear only entries for this subject (optional)
-        older_than_minutes: Clear entries older than N minutes (optional)
+        older_than_minutes: DEPRECATED — no TTL in persistent store. Kept for backward compat.
 
     Returns:
         ScratchpadClearToolResult containing:
@@ -3527,18 +4015,12 @@ async def warn_scratchpad_clear(
         >>> # Clear all entries for a specific subject
         >>> result = await warn_scratchpad_clear(subject="WRN-00006")
         >>> print(f"Cleared {result.cleared_count} entries")
-
-        >>> # Clear all entries older than 10 minutes
-        >>> result = await warn_scratchpad_clear(older_than_minutes=10)
     """
     from app.adapters.scratchpad_store import get_scratchpad_store
 
     try:
         scratchpad = get_scratchpad_store()
-        result = scratchpad.clear(
-            subject=subject,
-            older_than_minutes=older_than_minutes,
-        )
+        result = scratchpad.clear(subject=subject)
 
         return ScratchpadClearToolResult(
             cleared_count=result.cleared_count,
@@ -3556,26 +4038,27 @@ async def warn_scratchpad_clear(
 
 @mcp.tool()
 async def warn_scratchpad_stats() -> ScratchpadStatsToolResult:
-    """Get statistics about the session-scoped scratchpad memory.
+    """Get statistics about the persistent scratchpad memory.
 
-    Returns token usage, entry counts, and savings metrics. Useful for
-    monitoring scratchpad utilization and compression effectiveness.
+    Returns token usage, entry counts, enrichment metrics, and savings info.
+    All data is aggregated directly from SQLite.
 
     Returns:
         ScratchpadStatsToolResult containing:
             - entry_count: Total number of entries
             - total_original_tokens: Sum of original token counts
             - total_minimized_tokens: Sum of minimized token counts
+            - total_enriched_tokens: Sum of enriched token counts
             - tokens_saved: Total tokens saved through minimization
             - savings_percentage: Percentage of tokens saved
-            - token_budget: Maximum allowed tokens
-            - token_budget_used: Current tokens used
-            - token_budget_remaining: Remaining token budget
+            - enriched_count: Entries with enrichment
+            - unenriched_count: Entries without enrichment
             - predicate_counts: Count by predicate type
+            - db_path: Path to the SQLite database
 
     Example:
         >>> stats = await warn_scratchpad_stats()
-        >>> print(f"Using {stats.token_budget_used}/{stats.token_budget} tokens")
+        >>> print(f"{stats.entry_count} entries, {stats.enriched_count} enriched")
         >>> print(f"Saved {stats.savings_percentage}% through minimization")
     """
     from app.adapters.scratchpad_store import get_scratchpad_store
@@ -3588,12 +4071,13 @@ async def warn_scratchpad_stats() -> ScratchpadStatsToolResult:
             entry_count=stats.entry_count,
             total_original_tokens=stats.total_original_tokens,
             total_minimized_tokens=stats.total_minimized_tokens,
+            total_enriched_tokens=stats.total_enriched_tokens,
             tokens_saved=stats.tokens_saved,
             savings_percentage=stats.savings_percentage,
-            token_budget=stats.token_budget,
-            token_budget_used=stats.token_budget_used,
-            token_budget_remaining=stats.token_budget_remaining,
+            enriched_count=stats.enriched_count,
+            unenriched_count=stats.unenriched_count,
             predicate_counts=stats.predicate_counts,
+            db_path=stats.db_path,
         )
 
     except Exception as e:
@@ -3603,13 +4087,406 @@ async def warn_scratchpad_stats() -> ScratchpadStatsToolResult:
             entry_count=0,
             total_original_tokens=0,
             total_minimized_tokens=0,
+            total_enriched_tokens=0,
             tokens_saved=0,
             savings_percentage=0.0,
-            token_budget=2000,
-            token_budget_used=0,
-            token_budget_remaining=2000,
+            enriched_count=0,
+            unenriched_count=0,
             predicate_counts={},
+            db_path="unknown",
         )
+
+
+# =============================================================================
+# SAMPLING - Server-Initiated LLM Completions
+# =============================================================================
+# Sampling is the MCP primitive that lets the SERVER ask the CLIENT's LLM to
+# generate content. This inverts the normal flow:
+#
+#   Normal:  Client (LLM) -> calls Tool -> Server returns data
+#   Sampling: Server -> asks Client (LLM) -> LLM generates enrichment
+#
+# Why sampling matters:
+# - The server has DATA (schematics, specs, relationships)
+# - The LLM has REASONING (analysis, explanation, synthesis)
+# - Sampling combines both: server provides context, LLM generates insight
+#
+# Key concepts:
+# - ctx.sample() sends a prompt to the client's LLM and returns the response
+# - result_type enables structured output via Pydantic model validation
+# - system_prompt sets the LLM's role and behavior for the sampling request
+# - temperature controls creativity (0.0 = deterministic, 1.0 = creative)
+# - model_preferences hints which model the client should use (client may ignore)
+#
+# Important: Sampling requires client support. The client must have a
+# sampling handler configured. Claude Desktop and FastMCP Client both
+# support sampling out of the box.
+#
+# Teaching note: This is the most "agentic" MCP primitive. It enables
+# tool chains where the server orchestrates multiple LLM calls to
+# build rich, contextual responses that neither the server nor the LLM
+# could produce alone.
+
+
+class SchematicExplanation(BaseModel):
+    """Structured output from LLM sampling for schematic explanation.
+
+    This Pydantic model defines what the LLM must return when explaining
+    a schematic. FastMCP automatically creates a synthetic 'final_response'
+    tool and validates the LLM's JSON output against this schema.
+
+    Teaching note: Using result_type with ctx.sample() gives you
+    type-safe, validated structured output from the LLM - no manual
+    JSON parsing or prompt engineering for output format needed.
+    """
+
+    plain_language_summary: str = Field(
+        description="A clear, jargon-free explanation of what this component does "
+        "and why it matters, suitable for a non-technical stakeholder"
+    )
+    key_capabilities: List[str] = Field(
+        description="3-5 bullet points highlighting the most important capabilities"
+    )
+    typical_failure_modes: List[str] = Field(
+        description="2-3 common ways this type of component can fail or degrade"
+    )
+    maintenance_tips: List[str] = Field(
+        description="2-3 practical maintenance recommendations"
+    )
+    integration_notes: str = Field(
+        description="How this component interacts with other systems on the robot"
+    )
+    safety_considerations: str = Field(
+        description="Safety implications and precautions for this component"
+    )
+
+
+class SchematicExplainerResult(BaseModel):
+    """Full result of the explain_schematic sampling tool.
+
+    Contains both the original schematic data and the LLM-generated
+    explanation, so the caller gets everything in one response.
+    """
+
+    schematic_id: str = Field(description="The schematic that was explained")
+    model: str = Field(description="Robot model identifier")
+    name: str = Field(description="Robot name")
+    component: str = Field(description="Component name")
+    category: str = Field(description="Component category")
+    status: str = Field(description="Schematic status")
+    explanation: SchematicExplanation = Field(
+        description="LLM-generated enriched explanation"
+    )
+    graph_context: Optional[List[Dict[str, str]]] = Field(
+        default=None,
+        description="Related entities from the knowledge graph, if available"
+    )
+    sampling_metadata: Dict[str, Any] = Field(
+        description="Metadata about the sampling request for observability"
+    )
+
+
+@mcp.tool()
+async def warn_explain_schematic(
+    # FastMCP automatically injects the Context parameter - it is NOT exposed
+    # as a tool parameter in the JSON schema sent to the LLM. The framework
+    # detects the Context type hint and provides the runtime context object.
+    ctx: Context,
+    schematic_id: str,
+    audience: Literal["technical", "executive", "field_technician"] = "technical",
+    include_graph_context: bool = True,
+) -> SchematicExplainerResult:
+    """Get an LLM-enriched explanation of a robot schematic.
+
+    This tool demonstrates MCP SAMPLING - the server asks the client's LLM
+    to generate a rich, structured explanation of a schematic. The server
+    provides raw data (schematic details, graph relationships), and the LLM
+    transforms it into an insightful, audience-appropriate explanation.
+
+    How it works:
+    1. Server fetches the schematic from the memory store
+    2. Server optionally fetches graph neighbors for relationship context
+    3. Server calls ctx.sample() with the data + a system prompt
+    4. Client's LLM generates a structured SchematicExplanation
+    5. Server combines everything into a SchematicExplainerResult
+
+    This is different from a regular tool because:
+    - A regular tool returns RAW DATA from the server
+    - A sampling tool returns LLM-ENRICHED DATA (server data + LLM reasoning)
+
+    Args:
+        schematic_id: The schematic ID to explain (e.g., "WRN-00001")
+        audience: Who the explanation is for, which adjusts tone and detail:
+            - "technical" - Engineers and developers (default)
+            - "executive" - Non-technical leadership
+            - "field_technician" - Hands-on maintenance staff
+        include_graph_context: Whether to fetch relationship data from the
+            knowledge graph for richer context (default: True)
+        ctx: FastMCP Context (injected automatically by the framework)
+
+    Returns:
+        SchematicExplainerResult containing:
+            - Original schematic metadata
+            - LLM-generated SchematicExplanation with structured fields
+            - Graph relationship context (if enabled)
+            - Sampling metadata for observability
+
+    Example:
+        >>> # Get a technical explanation of a sensor
+        >>> result = await warn_explain_schematic("WRN-00001")
+        >>> print(result.explanation.plain_language_summary)
+
+        >>> # Get an executive-friendly explanation
+        >>> result = await warn_explain_schematic(
+        ...     "WRN-00001",
+        ...     audience="executive"
+        ... )
+    """
+    # -------------------------------------------------------------------------
+    # Step 1: Fetch the schematic from the memory store
+    # -------------------------------------------------------------------------
+    memory = get_memory_store()
+    schematic = await memory.get_schematic(schematic_id)
+
+    if not schematic:
+        # Return a structured error result (consistent with other tools)
+        # rather than raising an exception, which would bubble up as a
+        # protocol-level error and give the LLM less to work with.
+        return SchematicExplainerResult(
+            schematic_id=schematic_id,
+            model="unknown",
+            name="unknown",
+            component="unknown",
+            category="unknown",
+            status="not_found",
+            explanation=SchematicExplanation(
+                plain_language_summary=f"Schematic '{schematic_id}' not found. Use warn_list_robots to see available schematics.",
+                key_capabilities=[],
+                typical_failure_modes=[],
+                maintenance_tips=[],
+                integration_notes="N/A",
+                safety_considerations="N/A",
+            ),
+            graph_context=None,
+            sampling_metadata={"error": f"Schematic '{schematic_id}' not found"},
+        )
+
+    await ctx.info(f"Fetched schematic: {schematic.component} ({schematic.id})")
+
+    # -------------------------------------------------------------------------
+    # Step 2: Optionally fetch graph context for relationship enrichment
+    # -------------------------------------------------------------------------
+    graph_relationships = None
+
+    if include_graph_context:
+        try:
+            from app.adapters.graph_store import get_graph_store
+
+            graph_store = get_graph_store()
+            outgoing = await graph_store.get_related(schematic_id)
+            incoming = await graph_store.get_subjects(schematic_id)
+
+            # Build graph relationships immutably via list comprehension
+            graph_relationships = [
+                {
+                    "direction": "outgoing",
+                    "predicate": rel.predicate,
+                    "target": rel.object,
+                }
+                for rel in outgoing
+            ] + [
+                {
+                    "direction": "incoming",
+                    "predicate": rel.predicate,
+                    "source": rel.subject,
+                }
+                for rel in incoming
+            ]
+
+            if graph_relationships:
+                await ctx.info(
+                    f"Found {len(graph_relationships)} graph relationships"
+                )
+        except Exception as e:
+            # Graph context is OPTIONAL - failures should not block the tool.
+            # If graph is unavailable, we proceed with vector-only context.
+            await ctx.info(f"Graph context unavailable (non-critical): {e}")
+            graph_relationships = None
+
+    # -------------------------------------------------------------------------
+    # Step 3: Build the sampling prompt with all available context
+    # -------------------------------------------------------------------------
+    # Audience-specific system prompts tune the LLM's output style
+    audience_prompts = {
+        "technical": (
+            "You are a senior robotics engineer explaining a component schematic "
+            "to a fellow engineer. Use precise technical language, reference "
+            "specifications directly, and focus on implementation details."
+        ),
+        "executive": (
+            "You are a technical advisor explaining a robot component to a "
+            "C-suite executive. Avoid jargon, focus on business impact, risk, "
+            "and cost implications. Use analogies where helpful."
+        ),
+        "field_technician": (
+            "You are a senior field technician briefing a colleague before a "
+            "maintenance job. Be practical and specific. Focus on what to look "
+            "for, what can go wrong, and how to fix it. Skip theory."
+        ),
+    }
+
+    system_prompt = audience_prompts[audience]
+
+    # Format specifications immutably
+    specs_text = (
+        "\n".join(
+            f"  - {k}: {v}" for k, v in schematic.specifications.items()
+        )
+        if schematic.specifications
+        else "No specifications listed."
+    )
+
+    # Format graph context immutably
+    graph_text = (
+        "\n".join(
+            f"  - {schematic_id} --[{rel['predicate']}]--> {rel['target']}"
+            if rel["direction"] == "outgoing"
+            else f"  - {rel['source']} --[{rel['predicate']}]--> {schematic_id}"
+            for rel in graph_relationships
+        )
+        if graph_relationships
+        else "No graph relationships available."
+    )
+
+    # The user message provides all the raw data for the LLM to reason over
+    user_message = f"""Explain the following robot schematic component.
+
+## Schematic Data
+- ID: {schematic.id}
+- Robot Model: {schematic.model} ({schematic.name})
+- Component: {schematic.component}
+- Category: {schematic.category}
+- Version: {schematic.version}
+- Status: {schematic.status.value}
+- Last Verified: {schematic.last_verified}
+
+## Technical Summary
+{schematic.summary}
+
+## Specifications
+{specs_text}
+
+## Tags
+{', '.join(schematic.tags) if schematic.tags else 'None'}
+
+## Knowledge Graph Relationships
+{graph_text}
+
+Based on all the above data, provide a comprehensive explanation of this component.
+Tailor your response for a {audience} audience."""
+
+    await ctx.info(f"Requesting LLM explanation for {audience} audience...")
+
+    # -------------------------------------------------------------------------
+    # Step 4: Call ctx.sample() - the server asks the LLM to generate content
+    # -------------------------------------------------------------------------
+    # This is the core sampling call. Key parameters:
+    #   messages: The data-rich prompt for the LLM
+    #   system_prompt: Audience-specific persona and instructions
+    #   result_type: Pydantic model for validated structured output
+    #   temperature: Low for factual accuracy
+    #   max_tokens: Enough room for a thorough explanation
+    #   model_preferences: Hint to use a capable model (client may ignore)
+
+    try:
+        sampling_result = await ctx.sample(
+            messages=user_message,
+            system_prompt=system_prompt,
+            result_type=SchematicExplanation,
+            temperature=0.3,
+            max_tokens=1024,
+            model_preferences=["claude-sonnet-4-20250514", "claude-haiku-4-20250414"],
+        )
+    except Exception as e:
+        # Return structured error instead of raising, consistent with other tools
+        await ctx.info(f"LLM sampling failed: {e}")
+        return SchematicExplainerResult(
+            schematic_id=schematic.id,
+            model=schematic.model,
+            name=schematic.name,
+            component=schematic.component,
+            category=schematic.category,
+            status=schematic.status.value,
+            explanation=SchematicExplanation(
+                plain_language_summary=(
+                    f"Sampling failed: {e}. "
+                    "Ensure the MCP client supports sampling and has a model configured."
+                ),
+                key_capabilities=[],
+                typical_failure_modes=[],
+                maintenance_tips=[],
+                integration_notes="N/A - sampling unavailable",
+                safety_considerations="N/A - sampling unavailable",
+            ),
+            graph_context=graph_relationships,
+            sampling_metadata={
+                "error": str(e),
+                "audience": audience,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    # sampling_result.result is a validated SchematicExplanation object
+    explanation = getattr(sampling_result, "result", None)
+    if explanation is None:
+        await ctx.info("Sampling returned no structured result")
+        return SchematicExplainerResult(
+            schematic_id=schematic.id,
+            model=schematic.model,
+            name=schematic.name,
+            component=schematic.component,
+            category=schematic.category,
+            status=schematic.status.value,
+            explanation=SchematicExplanation(
+                plain_language_summary="Sampling completed but returned no structured result.",
+                key_capabilities=[],
+                typical_failure_modes=[],
+                maintenance_tips=[],
+                integration_notes="N/A",
+                safety_considerations="N/A",
+            ),
+            graph_context=graph_relationships,
+            sampling_metadata={
+                "error": "No structured result from sampling",
+                "raw_text": getattr(sampling_result, "text", ""),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    await ctx.info("LLM explanation generated successfully")
+
+    # -------------------------------------------------------------------------
+    # Step 5: Combine server data + LLM enrichment into the final result
+    # -------------------------------------------------------------------------
+    return SchematicExplainerResult(
+        schematic_id=schematic.id,
+        model=schematic.model,
+        name=schematic.name,
+        component=schematic.component,
+        category=schematic.category,
+        status=schematic.status.value,
+        explanation=explanation,
+        graph_context=graph_relationships,
+        sampling_metadata={
+            "audience": audience,
+            "include_graph_context": include_graph_context,
+            "graph_relationships_count": (
+                len(graph_relationships) if graph_relationships else 0
+            ),
+            "sampling_history_length": len(sampling_result.history),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 # =============================================================================

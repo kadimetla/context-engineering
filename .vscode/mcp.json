@@ -1,20 +1,53 @@
 {
-  "servers": {
-    "warnerco-schematica": {
-      "command": "uv",
-      "args": ["run", "warnerco-mcp"],
-      "cwd": "${workspaceFolder}/src/warnerco/backend",
-      "env": {
-        "MEMORY_BACKEND": "chroma"
-      }
-    },
-    "warnerco-schematica-azure-apim": {
-      "url": "https://warnerco-apim.azure-api.net/mcp",
-      "transport": "http",
-      "headers": {
-        "Content-Type": "application/json",
-        "Ocp-Apim-Subscription-Key": "${env:APIM_SUBSCRIPTION_KEY}"
-      }
-    }
-  }
+	"servers": {
+		"warnerco-schematica": {
+			"command": "uv",
+			"args": [
+				"run",
+				"warnerco-mcp"
+			],
+			"cwd": "${workspaceFolder}/src/warnerco/backend",
+			"env": {
+				"MEMORY_BACKEND": "chroma"
+			},
+			"type": "stdio"
+		},
+		"warnerco-schematica-azure-apim": {
+			"url": "https://warnerco-apim.azure-api.net/mcp",
+			"transport": "http",
+			"headers": {
+				"Content-Type": "application/json",
+				"Ocp-Apim-Subscription-Key": "${env:APIM_SUBSCRIPTION_KEY}"
+			},
+			"type": "http"
+		},
+		"com.figma.mcp/mcp": {
+			"type": "http",
+			"url": "https://mcp.figma.com/mcp",
+			"gallery": "https://api.mcp.github.com",
+			"version": "1.0.3"
+		},
+		"io.github.github/github-mcp-server": {
+			"type": "stdio",
+			"command": "docker",
+			"args": [
+				"run",
+				"-i",
+				"--rm",
+				"-e",
+				"GITHUB_PERSONAL_ACCESS_TOKEN=${input:token}",
+				"ghcr.io/github/github-mcp-server:0.30.2"
+			],
+			"gallery": "https://api.mcp.github.com",
+			"version": "0.30.2"
+		}
+	},
+	"inputs": [
+		{
+			"id": "token",
+			"type": "promptString",
+			"description": "",
+			"password": true
+		}
+	]
 }

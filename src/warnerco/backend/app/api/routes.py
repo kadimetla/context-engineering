@@ -400,14 +400,15 @@ class ScratchpadStatsResponse(BaseModel):
     entry_count: int
     total_original_tokens: int
     total_minimized_tokens: int
+    total_enriched_tokens: int
     tokens_saved: int
     savings_percentage: float
-    token_budget: int
-    token_budget_used: int
-    token_budget_remaining: int
+    enriched_count: int
+    unenriched_count: int
     predicate_counts: Dict[str, int]
     oldest_entry: Optional[str] = None
     newest_entry: Optional[str] = None
+    db_path: str
 
 
 class ScratchpadEntryResponse(BaseModel):
@@ -418,10 +419,11 @@ class ScratchpadEntryResponse(BaseModel):
     predicate: str
     object_: str
     content: str
+    enriched_content: Optional[str] = None
     original_tokens: int
     minimized_tokens: int
+    enriched_tokens: int = 0
     created_at: str
-    expires_at: str
 
 
 class ScratchpadEntriesResponse(BaseModel):
@@ -448,14 +450,15 @@ async def scratchpad_stats():
             entry_count=stats.entry_count,
             total_original_tokens=stats.total_original_tokens,
             total_minimized_tokens=stats.total_minimized_tokens,
+            total_enriched_tokens=stats.total_enriched_tokens,
             tokens_saved=stats.tokens_saved,
             savings_percentage=stats.savings_percentage,
-            token_budget=stats.token_budget,
-            token_budget_used=stats.token_budget_used,
-            token_budget_remaining=stats.token_budget_remaining,
+            enriched_count=stats.enriched_count,
+            unenriched_count=stats.unenriched_count,
             predicate_counts=stats.predicate_counts,
             oldest_entry=stats.oldest_entry,
             newest_entry=stats.newest_entry,
+            db_path=stats.db_path,
         )
     except Exception as e:
         logger.exception("Scratchpad stats operation failed")
@@ -483,19 +486,21 @@ async def scratchpad_entries(
             enrich=False,
         )
 
-        entries = []
-        for entry in result.entries:
-            entries.append(ScratchpadEntryResponse(
+        entries = [
+            ScratchpadEntryResponse(
                 id=entry.id,
                 subject=entry.subject,
                 predicate=entry.predicate,
                 object_=entry.object_,
                 content=entry.content,
+                enriched_content=entry.enriched_content,
                 original_tokens=entry.original_tokens,
                 minimized_tokens=entry.minimized_tokens,
+                enriched_tokens=entry.enriched_tokens,
                 created_at=entry.created_at,
-                expires_at=entry.expires_at,
-            ))
+            )
+            for entry in result.entries
+        ]
 
         return ScratchpadEntriesResponse(
             entries=entries,

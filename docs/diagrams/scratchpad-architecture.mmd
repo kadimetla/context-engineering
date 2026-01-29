@@ -1,0 +1,158 @@
+---
+title: WARNERCO Schematica - Scratchpad Memory Architecture
+description: Session-scoped working memory with LLM minimization and enrichment
+---
+flowchart TB
+    subgraph External["External Interfaces"]
+        direction LR
+        MCPTools["<b>MCP Tools</b><br/>warn_scratchpad_write<br/>warn_scratchpad_read<br/>warn_scratchpad_clear<br/>warn_scratchpad_stats"]
+        Dashboard["<b>Dashboard</b><br/>static/dash/scratchpad/<br/>Web UI"]
+        LangGraph["<b>LangGraph Node</b><br/>inject_scratchpad()<br/>Pipeline Integration"]
+    end
+
+    subgraph Core["Core Scratchpad Store (In-Memory)"]
+        direction TB
+        Store["<b>ScratchpadStore</b><br/>Thread-safe RLock<br/>Singleton Pattern<br/>get_scratchpad_store()"]
+
+        subgraph Storage["Data Storage"]
+            Entries["<b>_entries</b><br/>Dict[str, ScratchpadEntry]<br/>In-memory triplets"]
+            Cache["<b>_enrichment_cache</b><br/>Dict[str, str]<br/>LLM enrichment cache"]
+        end
+
+        subgraph Config["Configuration"]
+            MaxTokens["<b>max_tokens</b><br/>Default: 2000<br/>Total budget"]
+            TTL["<b>entry_ttl_minutes</b><br/>Default: 30<br/>Entry lifetime"]
+            InjectBudget["<b>inject_budget</b><br/>Default: 1500<br/>LangGraph injection"]
+        end
+    end
+
+    subgraph Operations["Core Operations"]
+        direction TB
+
+        subgraph WriteOp["Write Operation"]
+            WriteInput["Input:<br/>subject, predicate, object_<br/>content, minimize=True"]
+            ValidatePred{"Valid<br/>Predicate?"}
+            CleanupWrite["_cleanup_expired()<br/>Remove expired entries"]
+            MinimizeCheck{"minimize<br/>=True?"}
+            LLMMinimize["<b>_minimize_content()</b><br/>LLM compression<br/>Preserve meaning"]
+            TokenCount["_count_tokens()<br/>tiktoken encoding"]
+            BudgetCheck["_enforce_token_budget()<br/>Evict oldest if needed"]
+            CreateEntry["Create ScratchpadEntry<br/>Generate unique ID<br/>Set expiration"]
+            WriteResult["Return:<br/>ScratchpadWriteResult<br/>tokens_saved, entry"]
+        end
+
+        subgraph ReadOp["Read Operation"]
+            ReadInput["Input:<br/>subject?, predicate?<br/>enrich=False"]
+            CleanupRead["_cleanup_expired()<br/>Remove expired entries"]
+            FilterEntries["Filter by subject<br/>Filter by predicate<br/>Sort by created_at"]
+            EnrichCheck{"enrich<br/>=True?"}
+            LLMEnrich["<b>_enrich_content()</b><br/>LLM expansion<br/>Add context"]
+            ReadResult["Return:<br/>ScratchpadReadResult<br/>entries, enriched_count"]
+        end
+
+        subgraph ClearOp["Clear Operation"]
+            ClearInput["Input:<br/>subject?<br/>older_than_minutes?"]
+            ClearFilter["Filter entries:<br/>- By subject<br/>- By age<br/>- All if no filter"]
+            DeleteEntries["Delete matched entries<br/>Clear enrichment cache"]
+            ClearResult["Return:<br/>ScratchpadClearResult<br/>cleared_count"]
+        end
+
+        subgraph StatsOp["Stats Operation"]
+            CalcStats["Calculate:<br/>- Entry count<br/>- Token usage<br/>- Savings %<br/>- Predicate counts"]
+            StatsResult["Return:<br/>ScratchpadStats<br/>Budget utilization"]
+        end
+    end
+
+    subgraph Models["Data Models (Pydantic)"]
+        direction LR
+        EntryModel["<b>ScratchpadEntry</b><br/>id, subject, predicate<br/>object_, content<br/>original_tokens<br/>minimized_tokens<br/>enriched_content<br/>created_at, expires_at"]
+        Predicates["<b>Valid Predicates</b><br/>observed<br/>inferred<br/>relevant_to<br/>summarized_as<br/>contradicts<br/>supersedes<br/>depends_on"]
+        ResultModels["<b>Result Models</b><br/>WriteResult<br/>ReadResult<br/>ClearResult<br/>Stats"]
+    end
+
+    subgraph LLMIntegration["LLM Integration"]
+        direction TB
+        MinimizePrompt["<b>Minimization Prompt</b><br/>Compress content<br/>Preserve meaning<br/>Reduce tokens"]
+        EnrichPrompt["<b>Enrichment Prompt</b><br/>Expand content<br/>Add context<br/>Query-aware"]
+        Fallback["<b>Fallback Logic</b><br/>Return original<br/>if LLM unavailable"]
+    end
+
+    subgraph Features["Key Features"]
+        direction LR
+        ThreadSafe["<b>Thread-Safe</b><br/>RLock for concurrent<br/>access"]
+        TokenMgmt["<b>Token Management</b><br/>tiktoken counting<br/>Budget enforcement<br/>Eviction policy"]
+        Expiration["<b>TTL Expiration</b><br/>Auto-cleanup<br/>Session-scoped"]
+        Compression["<b>Smart Compression</b><br/>LLM minimization<br/>40-60% savings"]
+    end
+
+    %% External connections
+    MCPTools --> Store
+    Dashboard --> Store
+    LangGraph --> Store
+
+    %% Store connections
+    Store --> Storage
+    Store --> Config
+    Store --> Operations
+
+    %% Write flow
+    WriteInput --> ValidatePred
+    ValidatePred -->|Invalid| WriteResult
+    ValidatePred -->|Valid| CleanupWrite
+    CleanupWrite --> MinimizeCheck
+    MinimizeCheck -->|Yes| LLMMinimize
+    MinimizeCheck -->|No| TokenCount
+    LLMMinimize --> TokenCount
+    TokenCount --> BudgetCheck
+    BudgetCheck --> CreateEntry
+    CreateEntry --> Entries
+    CreateEntry --> WriteResult
+
+    %% Read flow
+    ReadInput --> CleanupRead
+    CleanupRead --> FilterEntries
+    FilterEntries --> EnrichCheck
+    EnrichCheck -->|No| ReadResult
+    EnrichCheck -->|Yes| LLMEnrich
+    LLMEnrich --> Cache
+    LLMEnrich --> ReadResult
+
+    %% Clear flow
+    ClearInput --> ClearFilter
+    ClearFilter --> DeleteEntries
+    DeleteEntries --> Entries
+    DeleteEntries --> Cache
+    DeleteEntries --> ClearResult
+
+    %% Stats flow
+    Entries --> CalcStats
+    CalcStats --> StatsResult
+
+    %% LLM Integration
+    LLMMinimize -.-> MinimizePrompt
+    LLMEnrich -.-> EnrichPrompt
+    MinimizePrompt -.-> Fallback
+    EnrichPrompt -.-> Fallback
+
+    %% Models
+    Operations --> Models
+    Entries --> EntryModel
+    ValidatePred -.-> Predicates
+
+    %% Features
+    Store -.-> Features
+
+    %% Styling
+    classDef externalStyle fill:#e1f5ff,stroke:#01579b,stroke-width:2px
+    classDef coreStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:3px
+    classDef operationStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef llmStyle fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+    classDef modelStyle fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef featureStyle fill:#fff9c4,stroke:#f57f17,stroke-width:2px
+
+    class MCPTools,Dashboard,LangGraph externalStyle
+    class Store,Storage,Config,Entries,Cache coreStyle
+    class WriteOp,ReadOp,ClearOp,StatsOp,WriteInput,ReadInput,ClearInput operationStyle
+    class LLMIntegration,MinimizePrompt,EnrichPrompt,LLMMinimize,LLMEnrich llmStyle
+    class Models,EntryModel,Predicates,ResultModels modelStyle
+    class Features,ThreadSafe,TokenMgmt,Expiration,Compression featureStyle

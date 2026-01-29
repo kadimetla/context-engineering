@@ -1,13 +1,13 @@
 """Scratchpad Memory models for WARNERCO Robotics Schematica.
 
-This module defines Pydantic models for the session-scoped Scratchpad Memory
+This module defines Pydantic models for the persistent Scratchpad Memory
 layer that complements vector (Chroma) and graph (SQLite + NetworkX) memory.
 
 Key Concepts:
-- Scratchpad: In-memory working memory for observations and inferences
+- Scratchpad: SQLite-backed persistent memory for observations and inferences
 - Triplets: Subject-predicate-object entries with content
-- Minimization: LLM-powered compression on write
-- Enrichment: LLM-powered expansion on read
+- Minimization: LLM-powered compression on write (ingest)
+- Enrichment: LLM-powered expansion on write (ingest), persisted for reads
 
 Example:
     # Store an observation about a schematic
@@ -17,11 +17,11 @@ Example:
         object_="thermal_system",
         content="thermal issues with hydraulics",
         original_tokens=12,
-        minimized_tokens=8
+        minimized_tokens=8,
+        enriched_tokens=25
     )
 """
 
-from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
 from pydantic import BaseModel, Field
@@ -56,20 +56,21 @@ class ScratchpadEntry(BaseModel):
     """A single entry in the scratchpad memory.
 
     Represents a triplet (subject-predicate-object) with associated content,
-    token tracking, and temporal metadata.
+    token tracking, and temporal metadata. Entries persist in SQLite until
+    explicitly deleted.
 
     Attributes:
         id: Unique identifier for the entry
         subject: The entity being described (e.g., "WRN-00006", "query:thermal")
         predicate: Type of cognitive operation (observed, inferred, etc.)
         object_: Related entity or concept (e.g., "thermal_system", "issue")
-        content: The actual text content (minimized if applicable)
-        original_content: Original content before minimization (if minimized)
+        content: The minimized text content
+        original_content: Original content before minimization
         original_tokens: Token count of original content
         minimized_tokens: Token count after minimization
-        enriched_content: Expanded content (populated on read with enrich=True)
+        enriched_content: LLM-enriched content (populated on write)
+        enriched_tokens: Token count of enriched content
         created_at: ISO timestamp of entry creation
-        expires_at: ISO timestamp when entry should be evicted
         metadata: Optional additional properties
     """
 
@@ -84,10 +85,10 @@ class ScratchpadEntry(BaseModel):
     original_tokens: int = Field(default=0, description="Token count of original content")
     minimized_tokens: int = Field(default=0, description="Token count after minimization")
     enriched_content: Optional[str] = Field(
-        default=None, description="Expanded content from enrichment"
+        default=None, description="LLM-enriched content (populated on write)"
     )
+    enriched_tokens: int = Field(default=0, description="Token count of enriched content")
     created_at: str = Field(description="ISO timestamp of creation")
-    expires_at: str = Field(description="ISO timestamp of expiration")
     metadata: Optional[Dict] = Field(default=None, description="Additional properties")
 
     class Config:
@@ -98,17 +99,17 @@ class ScratchpadEntry(BaseModel):
 class ScratchpadStats(BaseModel):
     """Statistics about the scratchpad memory.
 
-    Provides token usage, entry counts, and savings metrics.
+    Provides token usage, entry counts, and savings/enrichment metrics.
     """
 
     entry_count: int = Field(description="Total number of entries")
     total_original_tokens: int = Field(description="Sum of original token counts")
     total_minimized_tokens: int = Field(description="Sum of minimized token counts")
+    total_enriched_tokens: int = Field(description="Sum of enriched token counts")
     tokens_saved: int = Field(description="Tokens saved through minimization")
     savings_percentage: float = Field(description="Percentage of tokens saved")
-    token_budget: int = Field(description="Maximum allowed tokens")
-    token_budget_used: int = Field(description="Current tokens used")
-    token_budget_remaining: int = Field(description="Remaining token budget")
+    enriched_count: int = Field(description="Number of entries with enrichment")
+    unenriched_count: int = Field(description="Number of entries without enrichment")
     predicate_counts: Dict[str, int] = Field(
         default_factory=dict, description="Count by predicate type"
     )
@@ -118,6 +119,7 @@ class ScratchpadStats(BaseModel):
     newest_entry: Optional[str] = Field(
         default=None, description="ISO timestamp of newest entry"
     )
+    db_path: str = Field(description="Path to the SQLite database")
 
 
 class ScratchpadWriteResult(BaseModel):
@@ -137,16 +139,13 @@ class ScratchpadWriteResult(BaseModel):
 class ScratchpadReadResult(BaseModel):
     """Result of a scratchpad read operation.
 
-    Contains matching entries and optional enrichment metadata.
+    Contains matching entries.
     """
 
     entries: List[ScratchpadEntry] = Field(
         default_factory=list, description="Matching entries"
     )
     total: int = Field(description="Total entries matching filters")
-    enriched_count: int = Field(
-        default=0, description="Number of entries that were enriched"
-    )
 
 
 class ScratchpadClearResult(BaseModel):
