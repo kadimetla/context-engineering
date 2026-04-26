@@ -61,6 +61,20 @@ class Settings(BaseSettings):
     scratchpad_db_path: str = "data/scratchpad/notes.db"  # SQLite database path (relative to backend/)
     scratchpad_inject_budget: int = 1500  # Tokens for LangGraph injection
 
+    # =========================================================================
+    # Episodic Memory (CoALA Tier 2)
+    # =========================================================================
+    # Episodic memory records timestamped session events (turns, tool calls,
+    # observations) and retrieves them via Park et al.'s scoring formula:
+    #   total = α_recency·recency + α_importance·importance + α_relevance·relevance
+    # See app/adapters/episodic_store.py for the implementation.
+    episodic_db_path: str = "data/episodic/events.db"
+    episodic_max_retrieval_k: int = 5
+    episodic_recency_half_life_hours: float = 24.0
+    episodic_weight_recency: float = 0.4
+    episodic_weight_importance: float = 0.3
+    episodic_weight_relevance: float = 0.3
+
     @property
     def chroma_path(self) -> Path:
         """Get absolute path to Chroma persist directory."""
@@ -79,6 +93,11 @@ class Settings(BaseSettings):
     def scratchpad_path(self) -> Path:
         """Get absolute path to scratchpad SQLite database."""
         return Path(__file__).parent.parent.resolve() / self.scratchpad_db_path
+
+    @property
+    def episodic_path(self) -> Path:
+        """Get absolute path to episodic SQLite database."""
+        return Path(__file__).parent.parent.resolve() / self.episodic_db_path
 
     @property
     def has_llm_config(self) -> bool:

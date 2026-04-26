@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Training materials and MCP server implementations for "Context Engineering with MCP" - a course teaching production MCP (Model Context Protocol) deployment. The flagship teaching application is WARNERCO Schematica, a FastAPI + FastMCP + LangGraph application demonstrating hybrid RAG with vector, graph, and scratchpad memory.
+Training materials and MCP server implementations for "Context Engineering with MCP" — a course teaching production MCP (Model Context Protocol) deployment. The flagship teaching application is WARNERCO Schematica, a FastAPI + FastMCP + LangGraph application that exercises **all four CoALA memory tiers** (Working / Episodic / Semantic / Procedural) in one coherent codebase. See `research_synthesis/` for the four independent deep-research reports that drove the design.
 
 ## Repository Structure
 
@@ -12,9 +12,9 @@ Training materials and MCP server implementations for "Context Engineering with 
 context-engineering/
 ├── src/warnerco/backend/          # WARNERCO Schematica - Primary Teaching App
 │   ├── app/                       # FastAPI + FastMCP + LangGraph
-│   │   ├── adapters/              # Memory backends (JSON, Chroma, Azure, Graph, Scratchpad)
-│   │   ├── langgraph/             # 7-node hybrid RAG pipeline
-│   │   ├── models/                # Pydantic models
+│   │   ├── adapters/              # Memory backends (JSON, Chroma, Azure, Graph, Scratchpad, Episodic, CoALA overview)
+│   │   ├── langgraph/             # 9-node hybrid RAG pipeline + consolidation cycle
+│   │   ├── models/                # Pydantic models (schematic, graph, scratchpad, episodic)
 │   │   ├── main.py                # FastAPI application
 │   │   └── mcp_tools.py           # FastMCP tool definitions
 │   ├── data/                      # JSON schematics + vector stores
@@ -29,6 +29,7 @@ context-engineering/
 ├── config/                        # Sample MCP client configs
 ├── diagrams/                      # High-level architecture (Mermaid)
 ├── instructor/                    # Instructor materials
+├── research_synthesis/            # Deep-research reports (Claude/ChatGPT/Gemini/Perplexity) on agent memory
 ├── .claude/agents/                # Claude Code agents
 └── .claude/skills/                # Claude Code skills
 ```
@@ -104,15 +105,20 @@ Resources use URI scheme: `memory://overview`, `memory://context-stream`
 
 ### WARNERCO Schematica
 - `src/warnerco/backend/app/main.py` - FastAPI application
-- `src/warnerco/backend/app/mcp_tools.py` - FastMCP tool definitions (all MCP primitives)
-- `src/warnerco/backend/app/langgraph/flow.py` - 7-node hybrid RAG orchestration
-- `src/warnerco/backend/app/adapters/` - Memory backends (JSON, Chroma, Azure, Graph, Scratchpad)
+- `src/warnerco/backend/app/mcp_tools.py` - FastMCP tool/resource/prompt definitions (28 tools, 11 resources, 5 prompts)
+- `src/warnerco/backend/app/langgraph/flow.py` - 9-node hybrid RAG orchestration
+- `src/warnerco/backend/app/langgraph/consolidate.py` - "Sleep cycle" — promotes working/episodic memory to semantic via MCP Sampling
+- `src/warnerco/backend/app/adapters/` - Memory backends (JSON, Chroma, Azure, Graph, Scratchpad, Episodic, CoALA overview)
+- `src/warnerco/backend/app/adapters/episodic_store.py` - SQLite event log with Park et al. recency × importance × relevance recall
+- `src/warnerco/backend/app/adapters/coala_overview.py` - Live four-tier snapshot helper for `memory://coala-overview`
 - `src/warnerco/backend/app/models/graph.py` - Entity and Relationship models
 - `src/warnerco/backend/app/models/scratchpad.py` - ScratchpadEntry, ScratchpadStats, predicate vocabulary
+- `src/warnerco/backend/app/models/episodic.py` - EventKind, EpisodicEvent, EpisodicRecallResult, ConsolidationResult
 - `src/warnerco/backend/app/adapters/graph_store.py` - SQLite + NetworkX graph store
-- `src/warnerco/backend/app/adapters/scratchpad_store.py` - In-memory store with LLM minimization/enrichment
+- `src/warnerco/backend/app/adapters/scratchpad_store.py` - SQLite store with LLM minimization/enrichment
 - `src/warnerco/backend/data/schematics/schematics.json` - Source of truth (25 robot schematics)
 - `src/warnerco/backend/scripts/index_graph.py` - Graph indexing script
+- `docs/tutorials/coala-memory-walkthrough.md` - Classroom demo script for the four-tier path
 
 ### Lab 01
 - `labs/lab-01-hello-mcp/starter/src/index.js` - Starting point for students
@@ -169,10 +175,17 @@ Set in `src/warnerco/backend/.env`:
 # Memory backend selection
 MEMORY_BACKEND=json  # json, chroma, or azure_search
 
-# Scratchpad Memory (session-scoped)
-SCRATCHPAD_MAX_TOKENS=2000              # Total token budget
-SCRATCHPAD_ENTRY_TTL_MINUTES=30         # Entry expiration
+# Scratchpad Memory (CoALA Tier 1 — working memory, persistent SQLite)
+SCRATCHPAD_DB_PATH=data/scratchpad/notes.db
 SCRATCHPAD_INJECT_BUDGET=1500           # Tokens for LangGraph injection
+
+# Episodic Memory (CoALA Tier 2 — timestamped events, persistent SQLite)
+EPISODIC_DB_PATH=data/episodic/events.db
+EPISODIC_MAX_RETRIEVAL_K=5               # Top-k for recall
+EPISODIC_RECENCY_HALF_LIFE_HOURS=24.0    # Park et al. half-life
+EPISODIC_WEIGHT_RECENCY=0.4              # α_recency
+EPISODIC_WEIGHT_IMPORTANCE=0.3           # α_importance
+EPISODIC_WEIGHT_RELEVANCE=0.3            # α_relevance
 
 # Azure AI Search (production)
 AZURE_SEARCH_ENDPOINT=https://your-search.search.windows.net
@@ -189,40 +202,42 @@ AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-ada-002
 ## WARNERCO Schematica Architecture
 
 ```
-+---------------------------------------------------------------+
-|                     FastAPI + FastMCP                         |
-+---------------------------------------------------------------+
-|  LangGraph Flow (7-node Hybrid RAG)                           |
-|  parse_intent -> query_graph -> inject_scratchpad -> retrieve |
-|  -> compress -> reason -> respond                             |
-+---------------------------------------------------------------+
-|  Hybrid Memory Layer                                          |
-|  +-------------------+  +-------------------+  +-------------+ |
-|  | Vector Store      |  | Graph Store       |  | Scratchpad  | |
-|  | JSON -> Chroma -> |  | SQLite + NetworkX |  | In-memory   | |
-|  | Azure AI Search   |  | (Knowledge Graph) |  | (Session)   | |
-|  +-------------------+  +-------------------+  +-------------+ |
-+---------------------------------------------------------------+
++--------------------------------------------------------------------------+
+|                          FastAPI + FastMCP                               |
++--------------------------------------------------------------------------+
+|  LangGraph Flow (9-node CoALA-tiered RAG)                                |
+|  parse_intent -> query_graph -> inject_scratchpad -> recall_episodes ->  |
+|  retrieve -> compress_context -> reason -> respond -> log_episode        |
++--------------------------------------------------------------------------+
+|  Four CoALA Memory Tiers (Sumers et al. 2024)                            |
+|  +------------+  +-----------+  +----------+  +------------------------+ |
+|  | Working    |  | Episodic  |  | Semantic |  | Procedural             | |
+|  | Scratchpad |  | events.db |  | Vector   |  | MCP Prompts (versioned)| |
+|  | (SQLite)   |  | (SQLite)  |  | store    |  | catalog://procedural   | |
+|  +------------+  +-----------+  +----------+  +------------------------+ |
++--------------------------------------------------------------------------+
+|  Consolidation ("sleep cycle"): scratchpad+episodic --(ctx.sample)--> semantic |
++--------------------------------------------------------------------------+
 ```
 
-**MCP Tools** (23 total registered):
+**MCP Tools** (28 total registered):
 - Vector/Schema: `warn_list_robots`, `warn_get_robot`, `warn_semantic_search`, `warn_memory_stats`, `warn_index_schematic`, `warn_compare_schematics`, `warn_create_schematic`, `warn_update_schematic`, `warn_delete_schematic`, `warn_explain_schematic`
 - Interactive (Elicitation/Sampling): `warn_guided_search`, `warn_feedback_loop`, `warn_replacement_advisor`
 - Graph: `warn_add_relationship`, `warn_graph_neighbors`, `warn_graph_path`, `warn_graph_stats`
-- Scratchpad: `warn_scratchpad_write`, `warn_scratchpad_read`, `warn_scratchpad_clear`, `warn_scratchpad_stats`
+- Scratchpad (CoALA working): `warn_scratchpad_write`, `warn_scratchpad_read`, `warn_scratchpad_clear`, `warn_scratchpad_stats`
+- Episodic (CoALA Tier 2): `warn_episodic_log`, `warn_episodic_recall`, `warn_episodic_recent`, `warn_episodic_stats`
+- Consolidation (CoALA "sleep cycle"): `warn_consolidate_memory`
 - Progressive tool loading (meta): `warn_search_tools`, `warn_describe_tool`
 
 ### Progressive Tool Loading
 
-Per Anthropic's "code execution with MCP" guidance — clients can discover tools cheaply instead of pre-loading every full schema. Measured on this server: full schemas for 23 tools = ~9064 tokens; summary index = ~533 tokens (95% saving); name-only = ~176 tokens (98% saving). See `docs/tutorials/progressive-tool-loading.md`.
+Per Anthropic's "code execution with MCP" guidance — clients can discover tools cheaply instead of pre-loading every full schema. The `warn_search_tools` and `warn_describe_tool` meta tools self-exclude from search results (so `count` ≤ 26 when `total` = 28). See `docs/tutorials/progressive-tool-loading.md`.
 
 ```python
 warn_search_tools(query="", detail="name")            # cheapest discovery
 warn_search_tools(query="graph", detail="summary")    # narrow it down
 warn_describe_tool(name="warn_graph_neighbors")       # full schema for one
 ```
-
-The two meta tools self-exclude from `warn_search_tools` results (so `count` is up to 21 even when `total` is 23).
 
 **API Endpoints**:
 | Method | Path | Description |
@@ -273,6 +288,35 @@ uv run python scripts/index_graph.py
 
 **LangGraph Integration**: The `query_graph` node (Node 2 in the pipeline) enriches retrieval context with graph relationships before vector search. It activates for DIAGNOSTIC and ANALYTICS intents, or when queries mention explicit relationships.
 
+### CoALA Four-Tier Memory (Sumers et al. 2024)
+
+The 9-node LangGraph pipeline maps each node to a CoALA tier so a class can see all four tiers exercised in one turn:
+
+| CoALA Tier | What it stores | Backed by | LangGraph node | Read tools | Write tools |
+|------------|----------------|-----------|----------------|------------|-------------|
+| Working | This-session observations & inferences | `data/scratchpad/notes.db` (SQLite) | `inject_scratchpad` | `warn_scratchpad_read` | `warn_scratchpad_write` |
+| Episodic | Timestamped past events with importance | `data/episodic/events.db` (SQLite) | `recall_episodes` (gated) + `log_episode` (always) | `warn_episodic_recall`, `warn_episodic_recent`, `warn_episodic_stats` | `warn_episodic_log` (auto from `log_episode`) |
+| Semantic | Durable, generalizable facts (incl. consolidated `FACT-*` records) | Vector store (Chroma/Azure/JSON) | `retrieve` | `warn_semantic_search`, `warn_get_robot`, `warn_list_robots` | `warn_index_schematic`, `warn_consolidate_memory` |
+| Procedural | Versioned skills/workflows | MCP `@mcp.prompt()` registrations | (user-invoked, not in pipeline) | `memory://procedural-catalog` | source control + CI |
+
+**Episodic recall scoring** (`app/adapters/episodic_store.py`) follows Park et al.'s formula:
+
+```
+total = α_recency · 0.5^(hours_since / half_life)
+      + α_importance · stored_importance
+      + α_relevance · bag_of_words_cosine(query, summary+content)
+```
+
+Per-event score breakdown is exposed via `warn_episodic_recall` so students can see why each memory surfaced. **Pedagogical simplification:** relevance is bag-of-words cosine, not embeddings — swap-in is at `_relevance()`. Recall is gated to ANALYTICS/DIAGNOSTIC intents only (LOOKUP/SEARCH skip — narrate during demo).
+
+**Consolidation cycle** (`app/langgraph/consolidate.py`) is the "sleep cycle" — uses `ctx.sample()` to read recent scratchpad+episodic memory, extract durable facts, and write them to the vector store as synthetic `Schematic` records (`id=FACT-*`, `category=consolidated_fact`, `model=MEMORY`). Logs an OBSERVATION back to episodic memory so consolidation itself becomes a memory. **ADD-only** — no Mem0 AUDN dedup.
+
+**Two new resources:**
+- `memory://coala-overview` — live JSON snapshot of all four tiers with current counts
+- `memory://procedural-catalog` — registered MCP Prompts with version metadata
+
+**Run the four-tier demo:** see `docs/tutorials/coala-memory-walkthrough.md` for the ~4-minute classroom path.
+
 ### Scratchpad Memory (Session Working Memory)
 
 WARNERCO Schematica includes a Scratchpad Memory layer for session-scoped observations and inferences. It provides working memory that persists during a conversation but resets between sessions.
@@ -302,8 +346,7 @@ WARNERCO Schematica includes a Scratchpad Memory layer for session-scoped observ
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `scratchpad_max_tokens` | 2000 | Total token budget for scratchpad |
-| `scratchpad_entry_ttl_minutes` | 30 | Entry expiration time |
+| `scratchpad_db_path` | `data/scratchpad/notes.db` | SQLite database path (relative to backend/) |
 | `scratchpad_inject_budget` | 1500 | Tokens for LangGraph injection |
 
 **LangGraph Integration**: The `inject_scratchpad` node (Node 3 in the pipeline) adds session context between graph query and vector retrieval. Entries are formatted as `[predicate] subject -> object: content` and injected into the compressed context under "Session Memory (Scratchpad)".

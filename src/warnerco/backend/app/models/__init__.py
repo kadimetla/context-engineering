@@ -32,6 +32,16 @@ from app.models.scratchpad import (
     VALID_SCRATCHPAD_PREDICATES,
 )
 
+from app.models.episodic import (
+    EventKind,
+    VALID_EVENT_KINDS,
+    EpisodicEvent,
+    EpisodicScoreBreakdown,
+    EpisodicRecallResult,
+    EpisodicStats,
+    ConsolidationResult,
+)
+
 __all__ = [
     # Schematic models
     "Schematic",
@@ -59,4 +69,12 @@ __all__ = [
     "ScratchpadClearResult",
     "SCRATCHPAD_PREDICATES",
     "VALID_SCRATCHPAD_PREDICATES",
+    # Episodic models (CoALA Tier 2)
+    "EventKind",
+    "VALID_EVENT_KINDS",
+    "EpisodicEvent",
+    "EpisodicScoreBreakdown",
+    "EpisodicRecallResult",
+    "EpisodicStats",
+    "ConsolidationResult",
 ]

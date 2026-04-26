@@ -136,7 +136,15 @@ class SemanticSearchResult(BaseModel):
     results: List[SearchResultItem] = Field(description="Matching schematics")
     total: int = Field(description="Total matches found")
     reasoning: str = Field(description="Explanation of search strategy")
-    query_time_ms: int = Field(description="Query execution time in milliseconds")
+    query_time_ms: float = Field(description="Query execution time in milliseconds")
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session id used for this query (auto-generated if caller did not pass one)",
+    )
+    recalled_episodes: List[str] = Field(
+        default_factory=list,
+        description="Episodic memory recall (CoALA Tier 2) — past events that informed this answer",
+    )
 
 
 class MemoryStatsResult(BaseModel):
@@ -547,6 +555,7 @@ async def warn_semantic_search(
     category: Optional[str] = None,
     model: Optional[str] = None,
     top_k: int = 5,
+    session_id: Optional[str] = None,
 ) -> SemanticSearchResult:
     """Search robot schematics using natural language queries.
 
@@ -607,6 +616,7 @@ async def warn_semantic_search(
         query=query,
         filters=filters if filters else None,
         top_k=top_k,
+        session_id=session_id,
     )
 
     # Transform results to structured format
@@ -630,6 +640,8 @@ async def warn_semantic_search(
         total=result.get("total_matches", 0),
         reasoning=result.get("reasoning", ""),
         query_time_ms=result.get("query_time_ms", 0),
+        session_id=result.get("session_id"),
+        recalled_episodes=result.get("recalled_episodes", []),
     )
 
 
@@ -2165,6 +2177,56 @@ uv run python scripts/index_azure_search.py
 """
 
 
+@mcp.resource("memory://coala-overview")
+async def coala_overview() -> str:
+    """Live four-tier CoALA memory snapshot — the class anchor resource.
+
+    Returns a JSON snapshot showing all four tiers (working / episodic /
+    semantic / procedural), what backs each, what tools/resources/prompts
+    read+write each, and current entry counts. Use this as the demo
+    centerpiece during the "all four tiers in one app" segment.
+
+    Reference: Sumers et al. (2024), "Cognitive Architectures for Language Agents"
+    """
+    import json as _json
+    from app.adapters.coala_overview import build_coala_overview
+
+    overview = await build_coala_overview()
+    return _json.dumps(overview, indent=2)
+
+
+@mcp.resource("memory://procedural-catalog")
+async def procedural_catalog() -> str:
+    """Catalog of CoALA procedural memory — i.e., MCP Prompts.
+
+    CoALA flags procedural memory as the riskiest tier to write to (Sumers
+    et al., 2024 — "learning new actions … can easily introduce bugs or
+    allow an agent to subvert its designers' intentions"). That's why MCP
+    Prompts are USER-invoked, not model-invoked, and why this catalog
+    exists — to make procedural memory visible and versioned.
+
+    Returns a JSON list of registered prompts with version metadata.
+    """
+    import json as _json
+    from app.adapters.coala_overview import PROCEDURAL_PROMPTS
+
+    return _json.dumps(
+        {
+            "tier": "coala.procedural",
+            "primitive": "MCP Prompts",
+            "count": len(PROCEDURAL_PROMPTS),
+            "procedural_memory": PROCEDURAL_PROMPTS,
+            "note": (
+                "Each prompt is user-invocable via the host's slash-command UI. "
+                "Procedural-memory writes (i.e., adding/editing prompts) live in "
+                "source control; CI publishes versions. This is intentional — see "
+                "CoALA §4.4 on procedural-memory risk."
+            ),
+        },
+        indent=2,
+    )
+
+
 @mcp.resource("schematic://{schematic_id}")
 async def get_schematic_resource(schematic_id: str) -> str:
     """Get a schematic as a Markdown document.
@@ -2898,7 +2960,7 @@ Access resource: `schematic://WRN-00001`
 
 @mcp.prompt()
 async def diagnostic_prompt(robot_id: str) -> str:
-    """Generate a diagnostic analysis prompt for a robot schematic.
+    """[CoALA: procedural memory — version 1.0.0] Generate a diagnostic analysis prompt for a robot schematic.
 
     This prompt template retrieves schematic details and generates a
     structured diagnostic analysis prompt that guides the LLM through
@@ -2989,7 +3051,7 @@ Please analyze this schematic and provide:
 
 @mcp.prompt()
 async def comparison_prompt(id1: str, id2: str) -> str:
-    """Generate a comparison analysis prompt for two schematics.
+    """[CoALA: procedural memory — version 1.0.0] Generate a comparison analysis prompt for two schematics.
 
     This prompt retrieves both schematics and generates a structured
     comparison prompt that guides the LLM through a systematic evaluation
@@ -3098,7 +3160,7 @@ async def search_strategy_prompt(
     query: str,
     filters: Optional[str] = None,
 ) -> str:
-    """Create an optimized search strategy prompt.
+    """[CoALA: procedural memory — version 1.0.0] Create an optimized search strategy prompt.
 
     This prompt generates guidance for formulating effective searches
     in the schematic database, based on the user's query and any filters.
@@ -3201,7 +3263,7 @@ Please optimize this search using the following approach:
 
 @mcp.prompt()
 async def maintenance_report_prompt(robot_model: str) -> str:
-    """Generate a maintenance report template for a robot model.
+    """[CoALA: procedural memory — version 1.0.0] Generate a maintenance report template for a robot model.
 
     This prompt retrieves all schematics for a specific robot model and
     generates a maintenance report template covering all components.
@@ -3303,7 +3365,7 @@ Available models can be found using the `catalog://models` resource.
 
 @mcp.prompt()
 async def schematic_review_prompt(schematic_id: str) -> str:
-    """Generate a technical review prompt for a schematic.
+    """[CoALA: procedural memory — version 1.0.0] Generate a technical review prompt for a schematic.
 
     This prompt retrieves a schematic and generates a structured technical
     review template that guides thorough documentation review.
@@ -4095,6 +4157,176 @@ async def warn_scratchpad_stats() -> ScratchpadStatsToolResult:
             predicate_counts={},
             db_path="unknown",
         )
+
+
+# =============================================================================
+# EPISODIC MEMORY TOOLS (CoALA Tier 2)
+# =============================================================================
+# Episodic memory records timestamped session events and recalls them via
+# Park et al.'s recency × importance × relevance score. See
+# app/adapters/episodic_store.py for the full implementation and the score
+# breakdown that surfaces in warn_episodic_recall.
+
+
+@mcp.tool()
+async def warn_episodic_log(
+    session_id: str,
+    kind: Literal["user_turn", "agent_response", "tool_call", "observation"],
+    summary: str,
+    content: str = "",
+    importance: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Append one event to episodic memory (CoALA Tier 2).
+
+    Importance is set at WRITE time. If omitted and an LLM is configured,
+    it is auto-scored 0.0-1.0 by a tiny LLM call; otherwise defaults to 0.3.
+
+    Args:
+        session_id: Session/conversation grouping id.
+        kind: One of user_turn, agent_response, tool_call, observation.
+        summary: Short text — this is what recall queries match against.
+        content: Full payload (JSON or text). Stored but not matched.
+        importance: 0.0-1.0; omit to let the LLM score it.
+
+    Returns:
+        Dict with event_id, importance, created_at, kind, session_id.
+    """
+    from app.adapters.episodic_store import get_episodic_store
+
+    try:
+        store = get_episodic_store()
+        event = await store.log(
+            session_id=session_id,
+            kind=kind,
+            summary=summary,
+            content=content,
+            importance=importance,
+            provenance={"source": "mcp_tool", "trust_level": "user"},
+        )
+        return {
+            "success": True,
+            "event_id": event.id,
+            "session_id": event.session_id,
+            "kind": event.kind.value,
+            "importance": event.importance,
+            "created_at": event.created_at,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def warn_episodic_recall(
+    query: str,
+    k: int = 5,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Recall the top-k most relevant episodic events for a query.
+
+    Implements Park et al.'s scoring formula:
+        total = α_recency · recency
+              + α_importance · importance
+              + α_relevance · relevance
+
+    Returns the events AND a per-event score breakdown so students can see
+    exactly why each memory surfaced. The α weights and the recency
+    half-life are read from settings (episodic_weight_*, half_life_hours).
+
+    Args:
+        query: The text to recall against. Tokenized and bag-of-words-cosined
+            against each event's summary + content.
+        k: Number of events to return.
+        session_id: Optional — restrict recall to one session.
+    """
+    from app.adapters.episodic_store import get_episodic_store
+
+    try:
+        store = get_episodic_store()
+        result = await store.recall(query=query, k=k, session_id=session_id)
+        return {
+            "success": True,
+            "events": [e.model_dump(mode="json") for e in result.events],
+            "scores": [s.model_dump() for s in result.scores],
+            "weights": result.weights,
+            "half_life_hours": result.half_life_hours,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "events": [], "scores": []}
+
+
+@mcp.tool()
+async def warn_episodic_recent(
+    session_id: Optional[str] = None,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """List the most recent episodic events (no scoring — just newest first).
+
+    Args:
+        session_id: Optional — limit to one session.
+        limit: Max events to return.
+    """
+    from app.adapters.episodic_store import get_episodic_store
+
+    try:
+        store = get_episodic_store()
+        events = store.recent(session_id=session_id, limit=limit)
+        return {
+            "success": True,
+            "events": [e.model_dump(mode="json") for e in events],
+            "total": len(events),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "events": [], "total": 0}
+
+
+@mcp.tool()
+async def warn_episodic_stats() -> Dict[str, Any]:
+    """Aggregate stats about episodic memory: counts, sessions, kind breakdown."""
+    from app.adapters.episodic_store import get_episodic_store
+
+    try:
+        store = get_episodic_store()
+        stats = store.stats()
+        return {"success": True, **stats.model_dump()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def warn_consolidate_memory(
+    ctx: Context,
+    since_minutes: int = 60,
+    max_facts: int = 5,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run one CoALA consolidation cycle (the "sleep cycle").
+
+    Reads recent scratchpad entries + recent episodic events, asks the
+    client's LLM (via MCP Sampling) to extract durable facts, and writes
+    them as synthetic Schematic records into the semantic vector store
+    (tagged category=consolidated_fact, id prefix FACT-).
+
+    Pedagogically, this tool exercises the full primitive stack:
+    - reads from working memory (scratchpad) and episodic memory
+    - calls Sampling to invoke the client's LLM
+    - writes to semantic memory (vector store)
+    - logs an OBSERVATION back into episodic memory
+
+    Args:
+        since_minutes: How far back to look in episodic memory.
+        max_facts: Cap on facts extracted per cycle.
+        session_id: Optional label written into the consolidated facts'
+            provenance and tags.
+    """
+    from app.langgraph.consolidate import consolidate_memory
+
+    result = await consolidate_memory(
+        ctx=ctx,
+        since_minutes=since_minutes,
+        max_facts=max_facts,
+        session_id=session_id,
+    )
+    return result.model_dump()
 
 
 # =============================================================================

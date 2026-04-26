@@ -1,20 +1,23 @@
 """LangGraph flow for retrieval-augmented reasoning about robot schematics.
 
-This module implements a 7-node RAG pipeline with Knowledge Graph and Scratchpad integration:
+This module implements a 9-node RAG pipeline that exercises all four CoALA
+memory tiers (working / episodic / semantic / procedural):
 
-    parse_intent -> query_graph -> inject_scratchpad -> retrieve -> compress_context -> reason -> respond
+    parse_intent -> query_graph -> inject_scratchpad -> recall_episodes ->
+    retrieve -> compress_context -> reason -> respond -> log_episode
 
-The query_graph node enriches the context with relationship data from the
-Knowledge Graph, enabling the LLM to understand connections between entities
-that vector search alone cannot capture.
-
-The inject_scratchpad node adds session-scoped working memory context,
-allowing the system to remember observations and inferences from the current session.
+CoALA tier mapping per node:
+- query_graph        : structured semantic memory (knowledge graph)
+- inject_scratchpad  : working memory (session observations)
+- recall_episodes    : episodic memory (past turns, gated by intent)
+- retrieve           : semantic memory (vector store)
+- log_episode        : episodic memory write (every turn becomes a memory)
 """
 
 import json
 import re
 import threading
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Annotated, Dict, List, Optional, TypedDict
@@ -43,12 +46,14 @@ class GraphState(TypedDict):
     query: str
     filters: Optional[Dict[str, Any]]
     top_k: int
+    session_id: str  # Stable id grouping events in episodic memory
 
     # Processing
     intent: Optional[QueryIntent]
     graph_context: List[str]  # Context from Knowledge Graph
     scratchpad_context: List[str]  # Context from Scratchpad Memory
     scratchpad_token_count: int  # Tokens used by scratchpad context
+    recalled_episodes: List[str]  # Formatted lines from episodic memory recall
     candidates: List[SearchResult]
     compressed_context: str
 
@@ -268,6 +273,42 @@ async def inject_scratchpad(state: GraphState) -> GraphState:
     return state
 
 
+async def recall_episodes(state: GraphState) -> GraphState:
+    """Recall relevant past events from episodic memory (CoALA Tier 2).
+
+    Node 4: Recall Episodes
+
+    Gated to ANALYTICS and DIAGNOSTIC intents. LOOKUP and SEARCH skip this
+    node — pure ID lookups don't benefit from session history, and ungated
+    recall pollutes the context for simple queries.
+
+    The Park et al. recency × importance × relevance score is computed inside
+    EpisodicStore.recall(); the per-event breakdown is exposed via
+    warn_episodic_recall, not threaded through here, to keep the pipeline lean.
+    """
+    from app.adapters.episodic_store import get_episodic_store
+
+    recalled: List[str] = []
+    if state["intent"] in (QueryIntent.ANALYTICS, QueryIntent.DIAGNOSTIC):
+        try:
+            store = get_episodic_store()
+            result = await store.recall(
+                query=state["query"],
+                k=settings.episodic_max_retrieval_k,
+            )
+            for ev in result.events:
+                recalled.append(
+                    f"[{ev.created_at}] ({ev.kind.value}, imp={ev.importance:.2f}) {ev.summary}"
+                )
+        except Exception as e:
+            # Episodic recall failures must not break the pipeline.
+            print(f"Episodic recall error (non-fatal): {e}", flush=True)
+
+    state["recalled_episodes"] = recalled
+    state["timings"]["recall_episodes"] = _elapsed_ms(state["start_time"])
+    return state
+
+
 async def retrieve(state: GraphState) -> GraphState:
     """Retrieve candidate schematics from memory backend.
 
@@ -329,6 +370,13 @@ def compress_context(state: GraphState) -> GraphState:
     if scratchpad_context:
         context_parts.append("=== Session Memory (Scratchpad) ===")
         context_parts.extend(scratchpad_context)
+        context_parts.append("")
+
+    # Include episodic recall (CoALA Tier 2 — past events scored by recency × importance × relevance)
+    recalled_episodes = state.get("recalled_episodes", [])
+    if recalled_episodes:
+        context_parts.append("=== Session History (Episodic) ===")
+        context_parts.extend(recalled_episodes)
         context_parts.append("")
 
     # Include graph context if available
@@ -468,6 +516,7 @@ def respond(state: GraphState) -> GraphState:
     state["response"] = {
         "success": state["error"] is None,
         "intent": state["intent"].value if state["intent"] else "unknown",
+        "session_id": state.get("session_id", ""),
         "results": [
             {
                 "id": r.schematic.id,
@@ -483,6 +532,7 @@ def respond(state: GraphState) -> GraphState:
         ],
         "graph_context": state.get("graph_context", []),
         "scratchpad_context": state.get("scratchpad_context", []),
+        "recalled_episodes": state.get("recalled_episodes", []),
         "context_summary": state["compressed_context"],
         "total_matches": len(state["candidates"]),
         "query_time_ms": total_time,
@@ -491,6 +541,58 @@ def respond(state: GraphState) -> GraphState:
         "timings": state["timings"],
     }
 
+    return state
+
+
+async def log_episode(state: GraphState) -> GraphState:
+    """Append this turn to episodic memory (CoALA Tier 2).
+
+    Node 9: Log Episode (last node — runs after respond).
+
+    Importance heuristic: errors are highly memorable, diagnostics medium,
+    everything else mundane. Real agents would learn this; for the class we
+    keep it as a transparent rule a student can read in two lines.
+    """
+    from app.adapters.episodic_store import get_episodic_store
+    from app.models.episodic import EventKind
+
+    try:
+        if state.get("error"):
+            importance = 0.8
+        elif state["intent"] == QueryIntent.DIAGNOSTIC:
+            importance = 0.6
+        elif state["intent"] == QueryIntent.ANALYTICS:
+            importance = 0.4
+        else:
+            importance = 0.3
+
+        total_matches = state["response"].get("total_matches", 0)
+        summary = (
+            f"Q: {state['query'][:120]} -> intent={state['intent'].value if state['intent'] else 'unknown'}"
+            f", matches={total_matches}"
+        )
+        content = json.dumps(
+            {
+                "query": state["query"],
+                "intent": state["intent"].value if state["intent"] else "unknown",
+                "matches": total_matches,
+                "error": state.get("error"),
+            }
+        )
+
+        store = get_episodic_store()
+        await store.log(
+            session_id=state.get("session_id", "anonymous"),
+            kind=EventKind.USER_TURN,
+            summary=summary,
+            content=content,
+            importance=importance,
+            provenance={"source": "langgraph_flow", "trust_level": "system"},
+        )
+    except Exception as e:
+        print(f"Episodic log_episode error (non-fatal): {e}", flush=True)
+
+    state["timings"]["log_episode"] = _elapsed_ms(state["start_time"])
     return state
 
 
@@ -510,35 +612,37 @@ class SchematicaGraph:
     async def _build_graph(self):
         """Build the LangGraph workflow.
 
-        The workflow follows this 7-node pipeline:
-        parse_intent -> query_graph -> inject_scratchpad -> retrieve -> compress_context -> reason -> respond
-
-        The query_graph node enriches context with Knowledge Graph relationships.
-        The inject_scratchpad node adds session-scoped working memory.
+        9-node pipeline that exercises all four CoALA memory tiers:
+        parse_intent -> query_graph -> inject_scratchpad -> recall_episodes ->
+          retrieve -> compress_context -> reason -> respond -> log_episode
         """
         try:
             from langgraph.graph import StateGraph, END
 
             workflow = StateGraph(GraphState)
 
-            # Add nodes (7-node pipeline)
+            # Add nodes (9-node pipeline)
             workflow.add_node("parse_intent", parse_intent)
             workflow.add_node("query_graph", query_graph)
             workflow.add_node("inject_scratchpad", inject_scratchpad)
+            workflow.add_node("recall_episodes", recall_episodes)
             workflow.add_node("retrieve", retrieve)
             workflow.add_node("compress_context", compress_context)
             workflow.add_node("reason", reason)
             workflow.add_node("respond", respond)
+            workflow.add_node("log_episode", log_episode)
 
             # Define edges
             workflow.set_entry_point("parse_intent")
             workflow.add_edge("parse_intent", "query_graph")
             workflow.add_edge("query_graph", "inject_scratchpad")
-            workflow.add_edge("inject_scratchpad", "retrieve")
+            workflow.add_edge("inject_scratchpad", "recall_episodes")
+            workflow.add_edge("recall_episodes", "retrieve")
             workflow.add_edge("retrieve", "compress_context")
             workflow.add_edge("compress_context", "reason")
             workflow.add_edge("reason", "respond")
-            workflow.add_edge("respond", END)
+            workflow.add_edge("respond", "log_episode")
+            workflow.add_edge("log_episode", END)
 
             self._graph = workflow.compile()
 
@@ -551,8 +655,18 @@ class SchematicaGraph:
         query: str,
         filters: Optional[Dict[str, Any]] = None,
         top_k: int = 5,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run the graph on a query."""
+        """Run the graph on a query.
+
+        Args:
+            query: The user query.
+            filters: Optional retrieval filters.
+            top_k: Top-k candidates from semantic search.
+            session_id: Optional session label. If omitted, a fresh per-call
+                session id is generated. Pass a stable value across turns to
+                get coherent multi-turn episodic recall during class demos.
+        """
         if self._graph is None:
             await self._build_graph()
 
@@ -560,10 +674,12 @@ class SchematicaGraph:
             "query": query,
             "filters": filters,
             "top_k": top_k,
+            "session_id": session_id or f"sess-{uuid.uuid4().hex[:8]}",
             "intent": None,
             "graph_context": [],
             "scratchpad_context": [],
             "scratchpad_token_count": 0,
+            "recalled_episodes": [],
             "candidates": [],
             "compressed_context": "",
             "response": {},
@@ -577,14 +693,16 @@ class SchematicaGraph:
             result = await self._graph.ainvoke(initial_state)
             return result["response"]
         else:
-            # Fallback: run nodes sequentially (7-node pipeline)
+            # Fallback: run nodes sequentially (9-node pipeline)
             state = parse_intent(initial_state)
             state = await query_graph(state)
             state = await inject_scratchpad(state)
+            state = await recall_episodes(state)
             state = await retrieve(state)
             state = compress_context(state)
             state = await reason(state)
             state = respond(state)
+            state = await log_episode(state)
             return state["response"]
 
 
@@ -597,6 +715,7 @@ async def run_query(
     query: str,
     filters: Optional[Dict[str, Any]] = None,
     top_k: int = 5,
+    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a query through the LangGraph flow.
 
@@ -606,6 +725,9 @@ async def run_query(
         query: Natural language query
         filters: Optional filters (category, model, status)
         top_k: Number of results to return
+        session_id: Optional stable session id. Pass the same value across
+            turns to get coherent multi-turn episodic recall. If omitted, a
+            fresh id is generated per call (each call is its own "session").
 
     Returns:
         QueryResponse as dictionary
@@ -616,4 +738,4 @@ async def run_query(
             if _graph is None:
                 _graph = SchematicaGraph()
 
-    return await _graph.run(query, filters, top_k)
+    return await _graph.run(query, filters, top_k, session_id=session_id)
